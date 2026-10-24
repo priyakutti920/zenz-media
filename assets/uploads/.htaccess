@@ -1,0 +1,29 @@
+# ----------------------------------------------------------------------
+# Security: Disable Script Execution in Uploads Directory
+# ----------------------------------------------------------------------
+Options -ExecCGI -Indexes
+
+<IfModule mod_php.c>
+    php_flag engine off
+</IfModule>
+<IfModule mod_php7.c>
+    php_flag engine off
+</IfModule>
+<IfModule mod_php8.c>
+    php_flag engine off
+</IfModule>
+
+# Block all PHP / executable extensions regardless of handler
+<FilesMatch "(?i)\.(php|php[0-9]?|phtml|phar|pl|py|cgi|sh|bash|exe|bat|cmd|pht|shtml)$">
+    <IfModule !mod_authz_core.c>
+        Order Deny,Allow
+        Deny from all
+    </IfModule>
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</FilesMatch>
+
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+</IfModule>

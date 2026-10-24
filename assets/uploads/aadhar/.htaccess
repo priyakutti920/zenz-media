@@ -1,0 +1,10 @@
+# ----------------------------------------------------------------------
+# Cloud Aspire Security: Deny all direct web access to sensitive Aadhaar documents
+# ----------------------------------------------------------------------
+<IfModule !mod_authz_core.c>
+    Order Deny,Allow
+    Deny from all
+</IfModule>
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>

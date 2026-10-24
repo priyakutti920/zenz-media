@@ -1,0 +1,83 @@
+# ----------------------------------------------------------------------
+# Security: Disable directory browsing
+# ----------------------------------------------------------------------
+Options -Indexes
+
+# ----------------------------------------------------------------------
+# Security: Block sensitive files & hidden directories
+# ----------------------------------------------------------------------
+<FilesMatch "^(error_log|\.installed|\.env|composer\.(json|lock)|install\.php|.*\.sql|.*\.md)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# ----------------------------------------------------------------------
+# Security Headers (Defense in Depth)
+# ----------------------------------------------------------------------
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always set Permissions-Policy "geolocation=(self), camera=(), microphone=()"
+    Header unset X-Powered-By
+</IfModule>
+
+# Block hidden files and folders (.git, etc.)
+RewriteEngine On
+
+RewriteRule "(^|/)\.(?!well-known)" - [F]
+
+# Block direct access to internal app, database, and test folders
+RewriteRule ^app/ - [F,L]
+RewriteRule ^database/ - [F,L]
+RewriteRule ^tests/ - [F,L]
+RewriteRule ^phpmyadmin - [F,L]
+
+# ----------------------------------------------------------------------
+# Routing Rules
+# ----------------------------------------------------------------------
+# Route /admin/ (or /admin) to admin.php (Admin login)
+RewriteRule ^admin/?$ admin.php [L]
+
+# Route /employee/* to employee_*.php (Symmetric RESTful URLs)
+RewriteRule ^employee/login/?$ login.php [L]
+RewriteRule ^employee/?$ employee_dashboard.php [L]
+RewriteRule ^employee/dashboard/?$ employee_dashboard.php [L]
+RewriteRule ^employee/attendance/?$ employee_attendance.php [L]
+RewriteRule ^employee/task/?$ employee_task.php [L]
+RewriteRule ^employee/tasks/?$ employee_task.php [L]
+RewriteRule ^employee/project/?$ employee_project.php [L]
+RewriteRule ^employee/projects/?$ employee_project.php [L]
+RewriteRule ^employee/leave/?$ employee_leave.php [L]
+RewriteRule ^employee/leaves/?$ employee_leave.php [L]
+RewriteRule ^employee/account/?$ employee_account.php [L]
+RewriteRule ^employee/logout/?$ employee_logout.php [L]
+
+# Redirect index.php to root
+RewriteCond %{THE_REQUEST} ^[A-Z]{3,9}\ /index\.php\ HTTP/
+RewriteRule ^index\.php$ / [R=301,L]
+
+# Redirect other .php URLs to extensionless URLs (excluding API endpoints, POST, and OPTIONS requests)
+RewriteCond %{REQUEST_METHOD} !=POST
+RewriteCond %{REQUEST_METHOD} !=OPTIONS
+RewriteCond %{REQUEST_URI} !^/passkey/
+RewriteCond %{THE_REQUEST} ^[A-Z]{3,9}\ /([^\.]+)\.php\ HTTP/
+RewriteRule ^([^\.]+)\.php$ /$1 [R=301,L]
+
+# Serve extensionless URLs as .php (Internal rewrite)
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteCond %{REQUEST_FILENAME}.php -f
+RewriteRule ^(.*)$ $1.php [L]
+
+# php -- BEGIN cPanel-generated handler, do not edit
+# Set the “alt-php83” package as the default “PHP” programming language.
+<IfModule mime_module>
+  AddHandler application/x-httpd-alt-php83 .php .php8 .phtml
+</IfModule>
+# php -- END cPanel-generated handler, do not edit

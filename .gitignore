@@ -1,0 +1,19 @@
+# Environment and secrets
+.env
+.env.backup
+.env.*.local
+
+# Sensitive documents
+/assets/uploads/aadhar/*
+!/assets/uploads/aadhar/.htaccess
+
+# Dependencies & Binaries
+/vendor/
+/composer.phar
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
