@@ -51,12 +51,38 @@ $workMode = $employee['work_mode'] ?? 'on_site';
 $empFullName = trim(($employee['first_name'] ?? '') . ' ' . ($employee['last_name'] ?? ''));
 $empDisplayCode = !empty($employee['employee_id']) ? $employee['employee_id'] : sprintf('EMP-%03d', $employee_id);
 
-// Get Active Shift Settings
-$activeShift = AttendanceHelper::getActiveShift($pdo);
+// Ensure Portal Closure schema is synced
+AttendanceHelper::ensurePortalClosureSchema($pdo);
+
+// Get Assigned Shift Settings for this Employee (with any approved exceptions)
+$activeShift = AttendanceHelper::getEmployeeShift($pdo, $employee_id, $today);
 $shiftStartTime = $activeShift['checkin_start'] ?? ($activeShift['start_time'] ?? '09:00:00');
-$shiftEndTime = $activeShift['checkout_time'] ?? ($activeShift['end_time'] ?? '18:00:00');
+$shiftEndTime = $activeShift['checkout_time'] ?? ($activeShift['end_time'] ?? '17:00:00');
 $graceMinutes = (int)($activeShift['grace_minutes'] ?? 10);
+$shiftWindow = AttendanceHelper::getShiftWindowForWorkday($activeShift, $today);
 $isEarly = (strtotime($currentTime) < strtotime($shiftEndTime));
+
+// Evaluate Authoritative Server-Side Portal Closure Status
+$portalClosure = AttendanceHelper::evaluatePortalClosureStatus($pdo, $employee_id);
+
+// Real-Time Heartbeat / Status API Endpoint for Active Sessions
+if (isset($_GET['action']) && $_GET['action'] === 'check_portal_status') {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([
+        'is_closed'               => $portalClosure['is_closed'],
+        'closure_reason'          => $portalClosure['closure_reason'],
+        'scheduled_checkout_time' => $portalClosure['scheduled_checkout_time'],
+        'scheduled_checkout_ts'   => $portalClosure['scheduled_checkout_ts'],
+        'seconds_remaining'       => $portalClosure['seconds_remaining'],
+        'time_remaining_text'     => $portalClosure['time_remaining_text'],
+        'message'                 => $portalClosure['message'],
+        'details'                 => $portalClosure['details'],
+        'needs_hr_review'         => $portalClosure['needs_hr_review'],
+        'server_time'             => $portalClosure['server_time'],
+        'server_date'             => $portalClosure['server_date']
+    ]);
+    exit();
+}
 
 // Get Office Geofencing Settings
 $officeSettings = AttendanceHelper::getOfficeLocationSettings($pdo);
@@ -73,6 +99,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['action'])) {
     }
 
     $action = $_POST['action'];
+
+    // ────────────────────────────────────────────────────────────────────────
+    // BACKEND CLOSURE ENFORCEMENT
+    // Revalidates shift schedule and server time on every attendance request.
+    // Strictly blocks bypass via direct URLs, API calls, page refreshes, dev tools.
+    // ────────────────────────────────────────────────────────────────────────
+    if (in_array($action, ['check_in', 'check_out', 'submit_request'], true)) {
+        $currentClosure = AttendanceHelper::evaluatePortalClosureStatus($pdo, $employee_id);
+        if ($currentClosure['is_closed']) {
+            $_SESSION['att_flash'] = "Your scheduled work hours have ended. Attendance access is now closed for today.";
+            $_SESSION['att_flash_type'] = "error";
+            header("Location: employee_attendance");
+            exit();
+        }
+    }
 
     // ────────────────────────────────────────────────────────────────────────
     // 1. CHECK-IN ACTION
@@ -358,9 +399,11 @@ $stmtToday->execute([$employee_id, $today]);
 $todaysRecord = $stmtToday->fetch(PDO::FETCH_ASSOC);
 
 // Determine Today's Status State
-// States: 'not_checked_in', 'checked_in', 'checked_out'
+// States: 'not_checked_in', 'checked_in', 'checked_out', 'portal_closed'
 $todayState = 'not_checked_in';
-if ($isCheckedIn) {
+if ($portalClosure['is_closed']) {
+    $todayState = 'portal_closed';
+} elseif ($isCheckedIn) {
     $todayState = 'checked_in';
 } elseif ($todaysRecord && !empty($todaysRecord['check_out'])) {
     $todayState = 'checked_out';
@@ -596,6 +639,55 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             right: 0;
             height: 4px;
             background: linear-gradient(90deg, #4f46e5, #06b6d4, #10b981);
+        }
+        .portal-closed-card::before {
+            background: linear-gradient(90deg, #e11d48, #f59e0b) !important;
+        }
+
+        /* ── Portal Auto-Closure & Live Cutoff Timer ── */
+        .portal-closure-box {
+            background: var(--att-danger-light);
+            border: 1.5px solid var(--att-danger-border);
+            border-radius: var(--att-radius-md);
+            padding: 16px 20px;
+            margin-top: 18px;
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            animation: fadeInDown 0.25s ease;
+        }
+        .portal-warning-box {
+            background: var(--att-warning-light);
+            border: 1.5px solid var(--att-warning-border);
+            border-radius: var(--att-radius-md);
+            padding: 12px 18px;
+            margin-bottom: 24px;
+            display: none;
+            align-items: center;
+            gap: 12px;
+            font-size: 0.92rem;
+            color: var(--att-warning);
+            font-weight: 600;
+            animation: fadeInDown 0.25s ease;
+        }
+        .btn-punch-closed {
+            background: var(--att-surface-subtle) !important;
+            color: var(--att-text-muted) !important;
+            border: 1.5px solid var(--att-border) !important;
+            cursor: not-allowed !important;
+            opacity: 0.75;
+        }
+        .badge-flagged-review {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: var(--att-radius-pill);
+            font-size: 0.8rem;
+            font-weight: 700;
+            background: var(--att-warning-light);
+            color: var(--att-warning);
+            border: 1px solid var(--att-warning-border);
         }
 
         .terminal-grid {
@@ -1272,14 +1364,31 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             <?php endif; ?>
         <?php endif; ?>
 
+        <!-- Real-Time Live Cutoff Warning Banner -->
+        <div id="portalCutoffWarningBanner" class="portal-warning-box"></div>
+        <div id="portalClosureLiveAlert" class="portal-closure-box" style="display:none; margin-bottom:24px;">
+            <i class="fa-solid fa-lock" style="color:var(--att-danger); font-size:1.35rem; margin-top:2px;"></i>
+            <div>
+                <div style="font-weight:800; font-size:1rem; color:var(--att-danger); line-height:1.4;">
+                    Your scheduled work hours have ended. Attendance access is now closed for today.
+                </div>
+                <div style="font-size:0.88rem; color:var(--att-text-muted); margin-top:4px; line-height:1.45;">
+                    The scheduled check-out time has arrived. Attendance actions have been automatically closed for today.
+                </div>
+            </div>
+        </div>
+
         <!-- Primary Hero Attendance Terminal Card -->
-        <section class="hero-terminal-card" aria-label="Today's Attendance Status">
+        <section class="hero-terminal-card <?php echo $portalClosure['is_closed'] ? 'portal-closed-card' : ''; ?>" aria-label="Today's Attendance Status">
             <div class="terminal-grid">
                 
                 <!-- Left: Status Display -->
                 <div>
                     <div class="status-eyebrow">
-                        <?php if ($todayState === 'checked_in'): ?>
+                        <?php if ($portalClosure['is_closed']): ?>
+                            <span class="pulse-dot pulse-idle" style="background:var(--att-danger);"></span>
+                            <span style="color:var(--att-danger); font-weight:700;">Shift Concluded &bull; Portal Closed</span>
+                        <?php elseif ($todayState === 'checked_in'): ?>
                             <span class="pulse-dot pulse-active"></span>
                             <span style="color:var(--att-success);">Current Status &bull; Active Shift</span>
                         <?php elseif ($todayState === 'checked_out'): ?>
@@ -1292,7 +1401,15 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                     </div>
 
                     <div class="status-title">
-                        <?php if ($todayState === 'checked_in'): ?>
+                        <?php if ($portalClosure['is_closed']): ?>
+                            <?php if ($portalClosure['needs_hr_review']): ?>
+                                Shift Cutoff Reached &bull; Preserved for HR Review
+                            <?php elseif ($todaysRecord && !empty($todaysRecord['check_out'])): ?>
+                                Shift Concluded at <?php echo date('h:i A', strtotime($todaysRecord['check_out'])); ?>
+                            <?php else: ?>
+                                Scheduled Work Hours Have Ended
+                            <?php endif; ?>
+                        <?php elseif ($todayState === 'checked_in'): ?>
                             On Duty &bull; Punched In at <?php echo date('h:i A', strtotime($currentPunchIn)); ?>
                         <?php elseif ($todayState === 'checked_out'): ?>
                             Shift Concluded at <?php echo date('h:i A', strtotime($todaysRecord['check_out'])); ?>
@@ -1301,11 +1418,46 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                         <?php endif; ?>
                     </div>
 
+                    <?php if ($portalClosure['is_closed']): ?>
+                        <div class="portal-closure-box">
+                            <i class="fa-solid fa-lock" style="color:var(--att-danger); font-size:1.35rem; margin-top:2px;"></i>
+                            <div>
+                                <div style="font-weight:800; font-size:1rem; color:var(--att-danger); line-height:1.4;">
+                                    Your scheduled work hours have ended. Attendance access is now closed for today.
+                                </div>
+                                <div style="font-size:0.88rem; color:var(--att-text-muted); margin-top:4px; line-height:1.45;">
+                                    <?php echo htmlspecialchars($portalClosure['details']); ?>
+                                </div>
+                                <?php if ($portalClosure['needs_hr_review']): ?>
+                                    <div style="margin-top:8px;">
+                                        <span class="badge-flagged-review"><i class="fa-solid fa-clock-rotate-left"></i> Flagged for HR Review &bull; Check-in preserved</span>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    <?php endif; ?>
+
                     <div class="status-details-row">
                         <div class="detail-item">
                             <span class="detail-label">Today's Date</span>
                             <span class="detail-val"><?php echo date('M d, Y'); ?></span>
                         </div>
+
+                        <div class="detail-item">
+                            <span class="detail-label">Scheduled Cutoff</span>
+                            <span class="detail-val" style="color:var(--att-text); font-weight:700;">
+                                <i class="fa-solid fa-clock"></i> <?php echo $portalClosure['scheduled_checkout_time']; ?>
+                            </span>
+                        </div>
+
+                        <?php if (!$portalClosure['is_closed']): ?>
+                            <div class="detail-item">
+                                <span class="detail-label">Remaining Time</span>
+                                <span class="detail-val" id="portalRemainingTimeDisplay" style="color:var(--att-brand); font-weight:700; font-variant-numeric:tabular-nums;">
+                                    <?php echo $portalClosure['time_remaining_text']; ?>
+                                </span>
+                            </div>
+                        <?php endif; ?>
 
                         <?php if ($todaysRecord && !empty($todaysRecord['check_in'])): ?>
                             <div class="detail-item">
@@ -1323,6 +1475,13 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                 <span class="detail-label">Total Work Duration</span>
                                 <span class="detail-val" style="color:var(--att-brand);">
                                     <?php echo (float)$todaysRecord['working_hours']; ?> hours
+                                </span>
+                            </div>
+                        <?php elseif ($portalClosure['needs_hr_review']): ?>
+                            <div class="detail-item">
+                                <span class="detail-label">Check-Out Status</span>
+                                <span class="detail-val" style="color:var(--att-warning); font-weight:700;">
+                                    Pending HR Review
                                 </span>
                             </div>
                         <?php endif; ?>
@@ -1350,7 +1509,34 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
                 <!-- Right: Single Primary Action -->
                 <div class="primary-action-wrap">
-                    <?php if ($todayState === 'not_checked_in'): ?>
+                    <?php if ($portalClosure['is_closed']): ?>
+                        <div style="display:flex; flex-direction:column; gap:8px; align-items:flex-end;">
+                            <button type="button" class="btn-punch btn-punch-closed" disabled>
+                                <i class="fa-solid fa-lock"></i>
+                                <span>Portal Access Closed</span>
+                            </button>
+                            <div class="action-subtext" style="color:var(--att-danger); font-weight:600;">
+                                <i class="fa-solid fa-ban"></i> Attendance access is now closed for today
+                            </div>
+                            <?php if ($todaysRecord && (!empty($todaysRecord['work_summary']) || !empty($todaysRecord['completed_tasks']))): ?>
+                                <button type="button" class="btn-view-summary" style="padding: 10px 18px; font-size: 0.88rem; margin-top:4px;" onclick="openViewSummaryModal(<?php echo htmlspecialchars(json_encode([
+                                    'date'            => date('D, M j, Y', strtotime($todaysRecord['date'])),
+                                    'status'          => ucfirst(str_replace('_', ' ', $todaysRecord['attendance_status'] ?? ($todaysRecord['status'] ?? 'present'))),
+                                    'check_in'        => date('h:i A', strtotime($todaysRecord['check_in'])),
+                                    'check_out'       => !empty($todaysRecord['check_out']) ? date('h:i A', strtotime($todaysRecord['check_out'])) : 'N/A (Flagged for HR)',
+                                    'hours'           => ($todaysRecord['working_hours'] ?: '0.00') . ' hrs',
+                                    'work_summary'    => $todaysRecord['work_summary'] ?? '',
+                                    'completed_tasks' => $todaysRecord['completed_tasks'] ?? '',
+                                    'pending_tasks'   => $todaysRecord['pending_tasks'] ?? '',
+                                    'leave_code'      => $todaysRecord['leave_code'] ?? '',
+                                    'check_in_dist'   => $todaysRecord['check_in_dist'] ?? null,
+                                    'check_out_dist'  => $todaysRecord['check_out_dist'] ?? null
+                                ]), ENT_QUOTES, 'UTF-8'); ?>)">
+                                    <i class="fa-solid fa-file-lines"></i> View Today's Summary
+                                </button>
+                            <?php endif; ?>
+                        </div>
+                    <?php elseif ($todayState === 'not_checked_in'): ?>
                         <?php if ($todayRequest && $todayRequest['status'] === 'pending'): ?>
                             <button type="button" class="btn-punch" style="background:var(--att-surface-subtle); color:var(--att-text-muted); border:1.5px solid var(--att-border); cursor:not-allowed;" disabled>
                                 <i class="fa-solid fa-hourglass-half"></i>
@@ -1927,6 +2113,23 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         const canCheckInNow = <?php echo ($scheduledWindowCheck ? ($scheduledWindowCheck['can_check_in'] ? 'true' : 'false') : 'true'); ?>;
         const scheduledCheckInMessage = <?php echo json_encode($scheduledWindowCheck['message'] ?? ''); ?>;
 
+        // Authoritative Server-Synchronized Portal Closure Parameters
+        const isPortalClosedInitial = <?php echo $portalClosure['is_closed'] ? 'true' : 'false'; ?>;
+        const scheduledCutoffTs = <?php echo (int)$portalClosure['scheduled_checkout_ts']; ?>;
+        const serverClockSkewMs = <?php echo (time() * 1000); ?> - Date.now();
+
+        function getAuthoritativeServerTimeSec() {
+            return Math.floor((Date.now() + serverClockSkewMs) / 1000);
+        }
+
+        function isPortalClosedNow() {
+            if (isPortalClosedInitial) return true;
+            if (scheduledCutoffTs > 0 && getAuthoritativeServerTimeSec() >= scheduledCutoffTs) {
+                return true;
+            }
+            return false;
+        }
+
         let lastCapturedCoords = { lat: null, lng: null, dist: null };
 
         function showGpsNotice(msg, type = 'error') {
@@ -1955,6 +2158,12 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
         // ── 1. CHECK-IN HANDLER (GEOFENCE & SCHEDULED-TIME VERIFICATION) ──
         function triggerCheckIn() {
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                showGpsNotice("Your scheduled work hours have ended. Attendance access is now closed for today.", "error");
+                return;
+            }
+
             const btn = document.getElementById('btnCheckIn');
             hideGpsNotice();
 
@@ -2054,6 +2263,12 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         // ── 3. ATTENDANCE REQUEST MODAL (WFH & ON-SITE EXCEPTION) ──
         const attendanceRequestModal = document.getElementById('attendanceRequestModal');
         function openRequestModal(mode = 'wfh') {
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                alert("Your scheduled work hours have ended. Attendance access is now closed for today.");
+                return;
+            }
+
             closeLocationMismatchModal();
             if (!attendanceRequestModal) return;
 
@@ -2130,6 +2345,11 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         // ── 4. CHECK-OUT MODAL HANDLERS ──
         const checkoutModal = document.getElementById('checkoutModal');
         function openCheckoutModal() {
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                alert("Your scheduled work hours have ended. Attendance access is now closed for today.");
+                return;
+            }
             if (checkoutModal) checkoutModal.style.display = 'flex';
         }
         function closeCheckoutModal() {
@@ -2139,6 +2359,18 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         // Handle Checkout Form Submission (with GPS for on-site staff)
         function handleCheckoutSubmit(e) {
             e.preventDefault();
+
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                const errBox = document.getElementById('checkoutModalError');
+                if (errBox) {
+                    errBox.style.display = 'block';
+                    errBox.textContent = "Your scheduled work hours have ended. Attendance access is now closed for today.";
+                } else {
+                    alert("Your scheduled work hours have ended. Attendance access is now closed for today.");
+                }
+                return false;
+            }
 
             const summary = document.getElementById('work_summary')?.value.trim();
             const completed = document.getElementById('completed_tasks')?.value.trim();
@@ -2271,6 +2503,114 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         viewSummaryModal?.addEventListener('click', (e) => {
             if (e.target === viewSummaryModal) closeViewSummaryModal();
         });
+
+        // ── 6. REAL-TIME COUNTDOWN, AUTO-CLOSURE LOCK & SERVER HEARTBEAT ──
+        function formatRemainingTime(seconds) {
+            if (seconds <= 0) return '00h 00m 00s';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            return String(h).padStart(2, '0') + 'h ' + String(m).padStart(2, '0') + 'm ' + String(s).padStart(2, '0') + 's';
+        }
+
+        let warningTriggered15m = false;
+        let warningTriggered5m = false;
+
+        function updateClientPortalCutoffTimer() {
+            if (isPortalClosedInitial) return;
+            const nowSec = getAuthoritativeServerTimeSec();
+            const remainingSec = Math.max(0, scheduledCutoffTs - nowSec);
+
+            const displayEl = document.getElementById('portalRemainingTimeDisplay');
+            if (displayEl) {
+                displayEl.textContent = formatRemainingTime(remainingSec);
+            }
+
+            // Cutoff Warning at 15 minutes remaining
+            if (remainingSec > 0 && remainingSec <= 900 && !warningTriggered15m) {
+                warningTriggered15m = true;
+                showCutoffWarningBanner(15);
+            }
+
+            // Cutoff Warning at 5 minutes remaining
+            if (remainingSec > 0 && remainingSec <= 300 && !warningTriggered5m) {
+                warningTriggered5m = true;
+                showCutoffWarningBanner(5);
+            }
+
+            // Cutoff reached! Trigger immediate client-side lock
+            if (remainingSec <= 0) {
+                triggerPortalClosureLock();
+            }
+        }
+
+        function showCutoffWarningBanner(minutes) {
+            const banner = document.getElementById('portalCutoffWarningBanner');
+            if (banner) {
+                banner.style.display = 'flex';
+                banner.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> <span><strong>Shift Cutoff Warning:</strong> Your scheduled work shift ends in less than ${minutes} minutes. Please complete check-out and submit your daily work summary prior to access closure.</span>`;
+            }
+        }
+
+        function triggerPortalClosureLock() {
+            // Dismiss active interactive modals immediately
+            closeCheckoutModal();
+            closeRequestModal();
+            closeLocationMismatchModal();
+
+            // Disable check-in button if present
+            const btnIn = document.getElementById('btnCheckIn');
+            if (btnIn) {
+                btnIn.disabled = true;
+                btnIn.className = 'btn-punch btn-punch-closed';
+                btnIn.innerHTML = '<i class="fa-solid fa-lock"></i> <span>Portal Access Closed</span>';
+            }
+
+            // Disable check-out button if present
+            const btnOut = document.getElementById('btnOpenCheckoutModal');
+            if (btnOut) {
+                btnOut.disabled = true;
+                btnOut.className = 'btn-punch btn-punch-closed';
+                btnOut.innerHTML = '<i class="fa-solid fa-lock"></i> <span>Portal Access Closed</span>';
+            }
+
+            // Hide cutoff warning banner if showing
+            const warningBanner = document.getElementById('portalCutoffWarningBanner');
+            if (warningBanner) {
+                warningBanner.style.display = 'none';
+            }
+
+            // Display live closure alert banner
+            const liveAlert = document.getElementById('portalClosureLiveAlert');
+            if (liveAlert) {
+                liveAlert.style.display = 'flex';
+            }
+
+            // Update remaining time display
+            const displayEl = document.getElementById('portalRemainingTimeDisplay');
+            if (displayEl) {
+                displayEl.textContent = '00h 00m 00s (Closed)';
+                displayEl.style.color = 'var(--att-danger)';
+            }
+        }
+
+        // Heartbeat API poll every 30 seconds to sync with authoritative server state
+        function pollServerClosureStatus() {
+            fetch('employee_attendance?action=check_portal_status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.is_closed) {
+                        triggerPortalClosureLock();
+                    }
+                })
+                .catch(() => {});
+        }
+
+        if (!isPortalClosedInitial && scheduledCutoffTs > 0) {
+            setInterval(updateClientPortalCutoffTimer, 1000);
+            setInterval(pollServerClosureStatus, 30000);
+            updateClientPortalCutoffTimer();
+        }
     </script>
 </body>
 </html>

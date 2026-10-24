@@ -119,6 +119,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
  }
 }
 
+// Handle Resolve Flagged Attendance (POST with CSRF)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'resolve_flagged_attendance' && isset($_POST['attendance_id'])) {
+ // Validate CSRF token
+ if (!Security::validateCSRFToken($_POST['csrf_token'] ?? '', 'attendance')) {
+  $message = 'Invalid security token. Please try again.';
+  $messageType = 'error';
+ } elseif (!$canManage) {
+  $message = 'Access Denied: You do not possess authorization to resolve flagged attendance records.';
+  $messageType = 'error';
+ } else {
+  $attendanceId = (int)$_POST['attendance_id'];
+  $approvedCheckOut = !empty($_POST['approved_check_out']) ? $_POST['approved_check_out'] : null;
+  $resolutionStatus = $_POST['resolution_status'] ?? 'present';
+  $resolutionNotes = trim($_POST['resolution_notes'] ?? '');
+
+  $res = AttendanceHelper::adminResolveFlaggedAttendance($pdo, $attendanceId, $adminId, [
+   'approved_check_out' => $approvedCheckOut,
+   'status' => $resolutionStatus,
+   'notes' => $resolutionNotes
+  ]);
+
+  if ($res['success']) {
+   $message = $res['message'];
+   $messageType = 'success';
+  } else {
+   $message = $res['message'];
+   $messageType = 'error';
+  }
+ }
+}
+
 // Generate CSRF token for the page forms
 $csrf_token = Security::generateCSRFToken('attendance');
 
@@ -273,6 +304,7 @@ try {
 }
 
 $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $totalHalfDay) / $totalRecorded) * 100, 1) : 0;
+$flaggedCount = AttendanceHelper::getFlaggedAttendanceCount($pdo);
 ?>
 
 <?php include 'header.php'; ?>
@@ -310,6 +342,25 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
  </svg>
  <?php endif; ?>
  <span><?php echo htmlspecialchars($message); ?></span>
+</div>
+<?php endif; ?>
+
+<!-- Flagged Records Notification Banner -->
+<?php if ($flaggedCount > 0): ?>
+<div style="background: linear-gradient(135deg, rgba(239, 68, 68, 0.08), rgba(220, 38, 38, 0.04)); border: 1.5px solid rgba(239, 68, 68, 0.25); border-radius: var(--radius-xl); padding: 16px 20px; margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px;">
+	<div style="display: flex; align-items: center; gap: 14px;">
+		<div style="width: 42px; height: 42px; border-radius: 10px; background: rgba(239, 68, 68, 0.15); color: #dc2626; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0;">
+			<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>
+		</div>
+		<div>
+			<div style="font-weight: 700; color: #b91c1c; font-size: 15px;">
+				Action Required: <?php echo $flaggedCount; ?> Attendance Record<?php echo $flaggedCount > 1 ? 's' : ''; ?> Flagged for HR Review
+			</div>
+			<div style="font-size: 13px; color: var(--text-secondary); margin-top: 2px;">
+				Employees reached shift cutoff without checking out. Actual check-in data has been preserved; HR review and checkout authorization is required.
+			</div>
+		</div>
+	</div>
 </div>
 <?php endif; ?>
 
@@ -627,6 +678,14 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
   <span class="att-status-badge att-status--<?php echo htmlspecialchars($rec['status']); ?>">
   <?php echo htmlspecialchars(ucfirst(str_replace('_', ' ', $rec['status']))); ?>
   </span>
+  <?php if (!empty($rec['is_flagged_for_review'])): ?>
+      <div style="margin-top: 4px;">
+          <span class="att-status-badge" style="background: rgba(239, 68, 68, 0.15); color: #dc2626; border: 1px solid rgba(239, 68, 68, 0.3); font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px;" title="<?php echo htmlspecialchars($rec['flag_reason'] ?? 'Shift cutoff reached without check-out'); ?>">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>
+              HR Review (Cutoff Unclosed)
+          </span>
+      </div>
+  <?php endif; ?>
   <?php if (!empty($rec['leave_code'])): ?>
       <div style="font-size:11px; margin-top:4px; color:var(--text-secondary);">Reason: <?php echo htmlspecialchars($rec['leave_code']); ?></div>
   <?php endif; ?>
@@ -658,6 +717,13 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
   </span>
   </td>
   <td>
+  <?php if (!empty($rec['is_flagged_for_review']) && $canManage): ?>
+  <button type="button" class="btn-action btn-sm" style="background: #fee2e2; color: #b91c1c; border: 1px solid #f87171; font-weight: 600; margin-right: 4px;"
+      onclick="openResolveFlagModal(<?php echo (int)$rec['id']; ?>, '<?php echo htmlspecialchars(addslashes($rec['first_name'] . ' ' . $rec['last_name'])); ?>', '<?php echo htmlspecialchars($rec['date']); ?>', '<?php echo htmlspecialchars($rec['check_in'] ? date('h:i A', strtotime($rec['check_in'])) : 'None'); ?>', '<?php echo htmlspecialchars(addslashes($rec['flag_reason'] ?? 'Cutoff unclosed')); ?>')" title="Resolve HR Review">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+      <span>HR Resolve</span>
+  </button>
+  <?php endif; ?>
   <button type="button" class="btn-action btn-secondary btn-sm"
   onclick="editAttendance('<?php echo htmlspecialchars($rec['employee_id']); ?>', '<?php echo htmlspecialchars($rec['date']); ?>', '<?php echo htmlspecialchars($rec['check_in'] ? date('H:i', strtotime($rec['check_in'])) : ''); ?>', '<?php echo htmlspecialchars($rec['check_out'] ? date('H:i', strtotime($rec['check_out'])) : ''); ?>', '<?php echo htmlspecialchars($rec['status']); ?>', '<?php echo htmlspecialchars(addslashes($rec['notes'] ?? '')); ?>')" style="margin-right: 4px;" title="Edit">
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -892,6 +958,69 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
   <div style="padding: 16px 28px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end;">
    <button type="button" class="btn btn-secondary" onclick="closeModal('adminWorkSummaryModal')">Close</button>
   </div>
+ </div>
+</div>
+
+<!-- Resolve Flagged Attendance Modal -->
+<div class="modal" id="resolveFlagModal">
+ <div class="modal-backdrop" onclick="closeModal('resolveFlagModal')"></div>
+ <div class="modal-content" style="max-width: 520px;">
+  <div class="modal-header">
+   <h2 class="modal-title">Resolve Cutoff Attendance Review</h2>
+   <button class="modal-close" onclick="closeModal('resolveFlagModal')">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+     <line x1="18" y1="6" x2="6" y2="18"></line>
+     <line x1="6" y1="6" x2="18" y2="18"></line>
+    </svg>
+   </button>
+  </div>
+  <form method="POST" action="" class="modal-form">
+   <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf_token); ?>">
+   <input type="hidden" name="action" value="resolve_flagged_attendance">
+   <input type="hidden" name="attendance_id" id="res_attendance_id" value="">
+
+   <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: var(--radius-lg); padding: 14px 16px; margin-bottom: 20px; font-size: 13px; color: #991b1b; line-height: 1.5;">
+    <div style="font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
+     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+     Unclosed Workday Flagged by System
+    </div>
+    <div><strong>Employee:</strong> <span id="res_emp_name">—</span></div>
+    <div><strong>Workday Date:</strong> <span id="res_date">—</span></div>
+    <div><strong>Preserved Check-In:</strong> <span id="res_check_in">—</span></div>
+    <div style="margin-top: 4px; font-size: 12px; color: #b91c1c;"><strong>Flag Reason:</strong> <span id="res_reason">—</span></div>
+   </div>
+
+   <div class="form-group">
+    <label for="res_approved_check_out">Approved Check-Out Time *</label>
+    <input type="time" id="res_approved_check_out" name="approved_check_out" class="input" required value="18:00">
+    <small style="color: var(--text-tertiary); font-size: 12px; margin-top: 4px; display: block;">Authorize employee departure time. Working hours and status will be recalculated automatically.</small>
+   </div>
+
+   <div class="form-group">
+    <label for="res_resolution_status">Final Attendance Status *</label>
+    <select id="res_resolution_status" name="resolution_status" class="input" required>
+     <option value="present">Present</option>
+     <option value="late">Late</option>
+     <option value="half_day">Half Day</option>
+     <option value="absent">Absent</option>
+    </select>
+   </div>
+
+   <div class="form-group">
+    <label for="res_resolution_notes">HR Resolution Notes / Justification *</label>
+    <textarea id="res_resolution_notes" name="resolution_notes" class="input" rows="3" placeholder="Enter reason for checkout time authorization..." required></textarea>
+   </div>
+
+   <div class="modal-actions">
+    <button type="button" class="btn btn-secondary" onclick="closeModal('resolveFlagModal')">Cancel</button>
+    <button type="submit" class="btn btn-primary" style="background: linear-gradient(135deg, #059669, #10b981);">
+     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="20 6 9 17 4 12"></polyline>
+     </svg>
+     Authorize &amp; Resolve
+    </button>
+   </div>
+  </form>
  </div>
 </div>
 
@@ -1586,6 +1715,7 @@ document.addEventListener('keydown', function(e) {
  if (e.key === 'Escape') {
   closeModal('markAttendanceModal');
   closeModal('adminWorkSummaryModal');
+  closeModal('resolveFlagModal');
  }
 });
 
@@ -1683,6 +1813,16 @@ function viewAdminWorkSummary(data) {
  document.getElementById('awsExtraInfo').innerHTML = extra.join(' &bull; ');
  
  openModal('adminWorkSummaryModal');
+}
+
+function openResolveFlagModal(id, empName, date, inTime, reason) {
+ document.getElementById('res_attendance_id').value = id;
+ document.getElementById('res_emp_name').textContent = empName;
+ document.getElementById('res_date').textContent = date;
+ document.getElementById('res_check_in').textContent = inTime;
+ document.getElementById('res_reason').textContent = reason;
+ document.getElementById('res_resolution_notes').value = '';
+ openModal('resolveFlagModal');
 }
 </script>
 

@@ -877,4 +877,544 @@ class AttendanceHelper {
         // Can check out if checked in but not yet checked out
         return $record && !empty($record['check_in']) && empty($record['check_out']);
     }
+
+    // =========================================================================
+    // AUTOMATIC PORTAL CLOSURE, SHIFT TIMING & HR REVIEW METHODS
+    // =========================================================================
+
+    /**
+     * Safe, idempotent schema check to guarantee portal closure columns exist
+     */
+    public static function ensurePortalClosureSchema($pdo) {
+        static $ensured = false;
+        if ($ensured) return;
+
+        try {
+            // Check attendance columns
+            $cols = $pdo->query("SHOW COLUMNS FROM attendance")->fetchAll(PDO::FETCH_COLUMN);
+            if (!in_array('is_flagged_for_review', $cols, true)) {
+                $pdo->exec("ALTER TABLE `attendance` ADD COLUMN `is_flagged_for_review` TINYINT(1) NOT NULL DEFAULT 0 AFTER `check_out_dist`");
+            }
+            if (!in_array('flag_reason', $cols, true)) {
+                $pdo->exec("ALTER TABLE `attendance` ADD COLUMN `flag_reason` VARCHAR(255) DEFAULT NULL AFTER `is_flagged_for_review`");
+            }
+            if (!in_array('closed_by_system', $cols, true)) {
+                $pdo->exec("ALTER TABLE `attendance` ADD COLUMN `closed_by_system` TINYINT(1) NOT NULL DEFAULT 0 AFTER `flag_reason`");
+            }
+
+            // Check employees columns
+            $empCols = $pdo->query("SHOW COLUMNS FROM employees")->fetchAll(PDO::FETCH_COLUMN);
+            if (!in_array('shift_id', $empCols, true)) {
+                $pdo->exec("ALTER TABLE `employees` ADD COLUMN `shift_id` INT(11) DEFAULT NULL AFTER `work_mode`");
+            }
+
+            // Check attendance_requests columns
+            $reqCols = $pdo->query("SHOW COLUMNS FROM attendance_requests")->fetchAll(PDO::FETCH_COLUMN);
+            if (!in_array('approved_check_out_time', $reqCols, true)) {
+                $pdo->exec("ALTER TABLE `attendance_requests` ADD COLUMN `approved_check_out_time` TIME DEFAULT NULL AFTER `approved_check_in_time`");
+            }
+
+            $ensured = true;
+        } catch (PDOException $e) {
+            error_log("ensurePortalClosureSchema notice: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Retrieve the shift assigned to a specific employee or fallback to active shift policy.
+     * Incorporates approved exceptions/schedule changes for a given date if present.
+     */
+    public static function getEmployeeShift($pdo, $employeeId = null, $date = null) {
+        if ($date === null) {
+            $date = date('Y-m-d');
+        }
+
+        $shift = null;
+
+        // 1. Check if employee has a specific assigned shift
+        if ($employeeId !== null && (int)$employeeId > 0) {
+            try {
+                $stmt = $pdo->prepare("SELECT s.* FROM employees e 
+                    JOIN shift_settings s ON e.shift_id = s.id 
+                    WHERE e.id = ? LIMIT 1");
+                $stmt->execute([(int)$employeeId]);
+                $shift = $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+            } catch (PDOException $e) {
+                error_log("Error fetching employee assigned shift: " . $e->getMessage());
+            }
+        }
+
+        // 2. Fall back to active shift policy
+        if (!$shift) {
+            $shift = self::getActiveShift($pdo);
+        }
+
+        // 3. Fall back to safe system defaults
+        if (!$shift) {
+            $shift = [
+                'id'                   => 1,
+                'shift_name'           => 'Regular Shift',
+                'description'          => 'Standard General Office Shift',
+                'checkin_start'        => '09:00:00',
+                'checkin_end'          => '10:00:00',
+                'checkout_time'        => '17:00:00',
+                'grace_minutes'        => 10,
+                'late_threshold'       => 10,
+                'early_exit_threshold' => 10,
+                'color'                => '#4f46e5',
+                'is_active'            => 1
+            ];
+        }
+
+        // 4. Incorporate approved schedule exceptions for this date if present
+        if ($employeeId !== null && (int)$employeeId > 0) {
+            $approvedReq = self::getTodayApprovedRequest($pdo, $employeeId, $date);
+            if ($approvedReq) {
+                if (!empty($approvedReq['approved_check_in_time'])) {
+                    $shift['checkin_start'] = $approvedReq['approved_check_in_time'];
+                    $shift['is_approved_exception'] = true;
+                }
+                if (!empty($approvedReq['approved_check_out_time'])) {
+                    $shift['checkout_time'] = $approvedReq['approved_check_out_time'];
+                    $shift['is_approved_exception'] = true;
+                }
+            }
+        }
+
+        return $shift;
+    }
+
+    /**
+     * Determine if a shift spans across midnight (overnight shift)
+     */
+    public static function isOvernightShift($shift) {
+        if (!$shift || empty($shift['checkin_start']) || empty($shift['checkout_time'])) {
+            return false;
+        }
+        $startSec = strtotime('1970-01-01 ' . $shift['checkin_start']);
+        $endSec   = strtotime('1970-01-01 ' . $shift['checkout_time']);
+        return ($endSec < $startSec);
+    }
+
+    /**
+     * Compute shift window timestamps for a given workday date.
+     * Correctly handles daytime shifts as well as overnight shifts spanning midnight.
+     */
+    public static function getShiftWindowForWorkday($shift, $workdayDate) {
+        $startTime = $shift['checkin_start'] ?? '09:00:00';
+        $endTime   = $shift['checkout_time'] ?? '17:00:00';
+        $isOvernight = self::isOvernightShift($shift);
+
+        $startTs = strtotime($workdayDate . ' ' . $startTime);
+        $endTs   = $isOvernight 
+            ? strtotime($workdayDate . ' ' . $endTime . ' +1 day')
+            : strtotime($workdayDate . ' ' . $endTime);
+
+        return [
+            'workday_date'        => $workdayDate,
+            'shift_name'          => $shift['shift_name'] ?? 'Regular Shift',
+            'checkin_start'       => $startTime,
+            'checkout_time'       => $endTime,
+            'is_overnight'        => $isOvernight,
+            'start_ts'            => $startTs,
+            'end_ts'              => $endTs,
+            'start_formatted'     => date('h:i A', $startTs),
+            'end_formatted'       => date('h:i A', $endTs),
+            'end_datetime'        => date('Y-m-d H:i:s', $endTs),
+            'end_date'            => date('Y-m-d', $endTs)
+        ];
+    }
+
+    /**
+     * Flag an attendance record for HR review without fabricating any check-out timestamp.
+     * Preserves true attendance data and sets audit flags.
+     */
+    public static function flagAttendanceForReview($pdo, $attendanceId, $reason) {
+        try {
+            $stmt = $pdo->prepare("UPDATE attendance SET 
+                is_flagged_for_review = 1,
+                flag_reason = ?,
+                closed_by_system = 1,
+                remarks = CONCAT(IFNULL(remarks, ''), IF(remarks IS NULL OR remarks = '', '', ' | '), ?),
+                updated_at = NOW()
+                WHERE id = ? AND (is_flagged_for_review = 0 OR is_flagged_for_review IS NULL)");
+            $stmt->execute([
+                $reason,
+                "[AUTO-CLOSED] " . $reason,
+                (int)$attendanceId
+            ]);
+            return true;
+        } catch (PDOException $e) {
+            error_log("flagAttendanceForReview error: " . $e->getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Authoritative Server-Side Evaluation of Portal Closure Status.
+     * 
+     * Enforces:
+     * - Server-side time in Asia/Kolkata timezone (never device clock).
+     * - Automatic closure when scheduled check-out time is reached.
+     * - Flagging records for HR review when checkout was not performed (no fabricated timestamp).
+     * - Immediate session closure when an employee checks out early.
+     * - Full support for overnight shifts, approved schedule changes, and active portal sessions.
+     */
+    public static function evaluatePortalClosureStatus($pdo, $employeeId, $currentTimestamp = null) {
+        // Enforce application timezone
+        if (date_default_timezone_get() !== 'Asia/Kolkata') {
+            date_default_timezone_set('Asia/Kolkata');
+        }
+
+        if ($currentTimestamp === null) {
+            $currentTimestamp = time();
+        }
+
+        $serverTime = date('H:i:s', $currentTimestamp);
+        $serverDate = date('Y-m-d', $currentTimestamp);
+
+        // Fetch assigned shift policy (with any approved exceptions)
+        $shift = self::getEmployeeShift($pdo, $employeeId, $serverDate);
+
+        // Check for any active open attendance record (handles today & plausible overnight shifts)
+        $activeOpenRec = self::getActiveOpenAttendance($pdo, $employeeId, $serverDate);
+
+        // ─────────────────────────────────────────────────────────────────────
+        // CASE 1: EMPLOYEE HAS AN ACTIVE OPEN ATTENDANCE SESSION
+        // ─────────────────────────────────────────────────────────────────────
+        if ($activeOpenRec) {
+            $workdayDate = $activeOpenRec['date'];
+            $window = self::getShiftWindowForWorkday($shift, $workdayDate);
+            $cutoffTs = $window['end_ts'];
+
+            // Has scheduled check-out cutoff been reached?
+            if ($currentTimestamp >= $cutoffTs) {
+                // Scheduled shift ended without employee checkout!
+                $flagReason = "Missing check-out before scheduled shift cutoff ({$window['end_formatted']})";
+                self::flagAttendanceForReview($pdo, $activeOpenRec['id'], $flagReason);
+
+                // Reload flagged state
+                $activeOpenRec['is_flagged_for_review'] = 1;
+                $activeOpenRec['flag_reason'] = $flagReason;
+                $activeOpenRec['closed_by_system'] = 1;
+
+                return [
+                    'is_closed'               => true,
+                    'closure_reason'          => 'scheduled_end_reached_missing_checkout',
+                    'scheduled_checkout_time' => $window['end_formatted'],
+                    'scheduled_checkout_raw'  => $shift['checkout_time'],
+                    'scheduled_checkout_ts'   => $cutoffTs,
+                    'seconds_remaining'       => 0,
+                    'time_remaining_text'     => '00h 00m 00s',
+                    'message'                 => 'Your scheduled work hours have ended. Attendance access is now closed for today.',
+                    'details'                 => "Your scheduled shift ended at {$window['end_formatted']}. Since check-out was not completed prior to the cutoff, your attendance session has been locked and flagged for HR review. Your actual check-in data has been safely preserved.",
+                    'needs_hr_review'         => true,
+                    'flag_reason'             => $flagReason,
+                    'attendance_record'       => $activeOpenRec,
+                    'shift'                   => $shift,
+                    'shift_window'            => $window,
+                    'server_time'             => $serverTime,
+                    'server_date'             => $serverDate,
+                    'can_check_in'            => false,
+                    'can_check_out'           => false,
+                    'can_submit_request'      => false
+                ];
+            }
+
+            // Portal is OPEN: Employee is on shift and cutoff has not arrived
+            $secsRemaining = max(0, $cutoffTs - $currentTimestamp);
+            $hours = floor($secsRemaining / 3600);
+            $mins  = floor(($secsRemaining % 3600) / 60);
+            $secs  = $secsRemaining % 60;
+            $remainingText = sprintf('%02dh %02dm %02ds', $hours, $mins, $secs);
+
+            return [
+                'is_closed'               => false,
+                'closure_reason'          => 'open_active_shift',
+                'scheduled_checkout_time' => $window['end_formatted'],
+                'scheduled_checkout_raw'  => $shift['checkout_time'],
+                'scheduled_checkout_ts'   => $cutoffTs,
+                'seconds_remaining'       => $secsRemaining,
+                'time_remaining_text'     => $remainingText,
+                'message'                 => "Shift active. Scheduled check-out at {$window['end_formatted']} ({$remainingText} remaining).",
+                'details'                 => "Please record your check-out and submit your daily work summary before {$window['end_formatted']}.",
+                'needs_hr_review'         => false,
+                'flag_reason'             => null,
+                'attendance_record'       => $activeOpenRec,
+                'shift'                   => $shift,
+                'shift_window'            => $window,
+                'server_time'             => $serverTime,
+                'server_date'             => $serverDate,
+                'can_check_in'            => false,
+                'can_check_out'           => true,
+                'can_submit_request'      => false
+            ];
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // CASE 2: NO ACTIVE OPEN ATTENDANCE SESSION
+        // ─────────────────────────────────────────────────────────────────────
+        // Check today's attendance record
+        $stmtToday = $pdo->prepare("SELECT * FROM attendance WHERE employee_id = ? AND date = ? LIMIT 1");
+        $stmtToday->execute([(int)$employeeId, $serverDate]);
+        $todayRec = $stmtToday->fetch(PDO::FETCH_ASSOC);
+
+        // Subcase 2A: Employee already checked out (early or regular)
+        if ($todayRec && !empty($todayRec['check_out'])) {
+            return [
+                'is_closed'               => true,
+                'closure_reason'          => 'already_checked_out',
+                'scheduled_checkout_time' => date('h:i A', strtotime($shift['checkout_time'])),
+                'scheduled_checkout_raw'  => $shift['checkout_time'],
+                'scheduled_checkout_ts'   => strtotime("$serverDate {$shift['checkout_time']}"),
+                'seconds_remaining'       => 0,
+                'time_remaining_text'     => '00h 00m 00s',
+                'message'                 => 'Your shift for today has been concluded.',
+                'details'                 => 'You have already completed check-out for today at ' . date('h:i A', strtotime($todayRec['check_out'])) . '. Attendance access is now closed for today.',
+                'needs_hr_review'         => !empty($todayRec['is_flagged_for_review']),
+                'flag_reason'             => $todayRec['flag_reason'] ?? null,
+                'attendance_record'       => $todayRec,
+                'shift'                   => $shift,
+                'shift_window'            => self::getShiftWindowForWorkday($shift, $serverDate),
+                'server_time'             => $serverTime,
+                'server_date'             => $serverDate,
+                'can_check_in'            => false,
+                'can_check_out'           => false,
+                'can_submit_request'      => false
+            ];
+        }
+
+        // Subcase 2B: Already flagged for review
+        if ($todayRec && !empty($todayRec['is_flagged_for_review'])) {
+            $window = self::getShiftWindowForWorkday($shift, $serverDate);
+            return [
+                'is_closed'               => true,
+                'closure_reason'          => 'flagged_for_review',
+                'scheduled_checkout_time' => $window['end_formatted'],
+                'scheduled_checkout_raw'  => $shift['checkout_time'],
+                'scheduled_checkout_ts'   => $window['end_ts'],
+                'seconds_remaining'       => 0,
+                'time_remaining_text'     => '00h 00m 00s',
+                'message'                 => 'Your scheduled work hours have ended. Attendance access is now closed for today.',
+                'details'                 => "Your attendance record is currently flagged for HR review: " . ($todayRec['flag_reason'] ?: 'Review required') . ".",
+                'needs_hr_review'         => true,
+                'flag_reason'             => $todayRec['flag_reason'] ?? 'Pending HR Review',
+                'attendance_record'       => $todayRec,
+                'shift'                   => $shift,
+                'shift_window'            => $window,
+                'server_time'             => $serverTime,
+                'server_date'             => $serverDate,
+                'can_check_in'            => false,
+                'can_check_out'           => false,
+                'can_submit_request'      => false
+            ];
+        }
+
+        // Subcase 2C: No check-in recorded yet for today's workday
+        $window = self::getShiftWindowForWorkday($shift, $serverDate);
+        $cutoffTs = $window['end_ts'];
+
+        if ($currentTimestamp >= $cutoffTs) {
+            // Cutoff has passed: No check-in occurred today and shift is over
+            return [
+                'is_closed'               => true,
+                'closure_reason'          => 'scheduled_end_reached_no_checkin',
+                'scheduled_checkout_time' => $window['end_formatted'],
+                'scheduled_checkout_raw'  => $shift['checkout_time'],
+                'scheduled_checkout_ts'   => $cutoffTs,
+                'seconds_remaining'       => 0,
+                'time_remaining_text'     => '00h 00m 00s',
+                'message'                 => 'Your scheduled work hours have ended. Attendance access is now closed for today.',
+                'details'                 => "The scheduled shift check-out cutoff ({$window['end_formatted']}) has passed. Check-in, check-out and attendance actions are now closed for today.",
+                'needs_hr_review'         => false,
+                'flag_reason'             => null,
+                'attendance_record'       => $todayRec ?: null,
+                'shift'                   => $shift,
+                'shift_window'            => $window,
+                'server_time'             => $serverTime,
+                'server_date'             => $serverDate,
+                'can_check_in'            => false,
+                'can_check_out'           => false,
+                'can_submit_request'      => false
+            ];
+        }
+
+        // Cutoff has not arrived yet: Portal is open for check-in / request
+        $secsRemaining = max(0, $cutoffTs - $currentTimestamp);
+        $hours = floor($secsRemaining / 3600);
+        $mins  = floor(($secsRemaining % 3600) / 60);
+        $secs  = $secsRemaining % 60;
+        $remainingText = sprintf('%02dh %02dm %02ds', $hours, $mins, $secs);
+
+        return [
+            'is_closed'               => false,
+            'closure_reason'          => 'open_pending_checkin',
+            'scheduled_checkout_time' => $window['end_formatted'],
+            'scheduled_checkout_raw'  => $shift['checkout_time'],
+            'scheduled_checkout_ts'   => $cutoffTs,
+            'seconds_remaining'       => $secsRemaining,
+            'time_remaining_text'     => $remainingText,
+            'message'                 => "Portal open. Shift check-out cutoff is at {$window['end_formatted']} ({$remainingText} remaining).",
+            'details'                 => "Ready for shift check-in. Scheduled cutoff is at {$window['end_formatted']}.",
+            'needs_hr_review'         => false,
+            'flag_reason'             => null,
+            'attendance_record'       => $todayRec ?: null,
+            'shift'                   => $shift,
+            'shift_window'            => $window,
+            'server_time'             => $serverTime,
+            'server_date'             => $serverDate,
+            'can_check_in'            => true,
+            'can_check_out'           => false,
+            'can_submit_request'      => true
+        ];
+    }
+
+    /**
+     * HR / Administrator Override to resolve flagged attendance records.
+     * Enforces attendance.manage permissions and records audit logs.
+     */
+    public static function adminResolveFlaggedAttendance($pdo, $attendanceId, $adminId, $approvedCheckOutTime, $resolutionNotes = '', $attendanceStatus = 'completed') {
+        if (is_array($approvedCheckOutTime)) {
+            $data = $approvedCheckOutTime;
+            $approvedCheckOutTime = $data['approved_check_out'] ?? ($data['check_out'] ?? '');
+            $resolutionNotes = $data['notes'] ?? ($data['resolution_notes'] ?? '');
+            $attendanceStatus = $data['status'] ?? ($data['resolution_status'] ?? 'completed');
+        }
+
+        if (empty($approvedCheckOutTime)) {
+            return ['success' => false, 'error' => 'An approved check-out time is mandatory.'];
+        }
+        if (empty(trim($resolutionNotes))) {
+            return ['success' => false, 'error' => 'A resolution reason / note is mandatory for the audit log.'];
+        }
+        if ($adminId && !Security::hasPermission('attendance.manage', $adminId)) {
+            return ['success' => false, 'error' => 'Access Denied: You do not possess authorization to modify attendance records.'];
+        }
+
+        // Format check-out time (HH:MM:SS)
+        $formattedTime = date('H:i:00', strtotime($approvedCheckOutTime));
+
+        try {
+            $pdo->beginTransaction();
+
+            $stmt = $pdo->prepare("SELECT a.*, e.first_name, e.last_name, e.shift_id 
+                FROM attendance a 
+                JOIN employees e ON a.employee_id = e.id 
+                WHERE a.id = ? FOR UPDATE");
+            $stmt->execute([(int)$attendanceId]);
+            $record = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$record) {
+                $pdo->rollBack();
+                return ['success' => false, 'error' => 'Attendance record not found.'];
+            }
+
+            $shift = self::getEmployeeShift($pdo, $record['employee_id'], $record['date']);
+            $delayMins = (int)$record['delay_minutes'];
+            $earlyExitMins = self::calculateEarlyExit($formattedTime, $shift);
+            $workData = self::calculateWorkingHours($record['check_in'], $formattedTime);
+
+            // Reconstruct punch history
+            $punchHistory = json_decode($record['punch_history'] ?? '[]', true) ?: [];
+            if (empty($punchHistory) && !empty($record['check_in'])) {
+                $punchHistory[] = ['in' => $record['check_in'], 'out' => $formattedTime];
+            } else {
+                $closedAny = false;
+                foreach ($punchHistory as &$p) {
+                    if (empty($p['out'])) {
+                        $p['out'] = $formattedTime;
+                        $closedAny = true;
+                        break;
+                    }
+                }
+                unset($p);
+                if (!$closedAny && !empty($punchHistory)) {
+                    $punchHistory[count($punchHistory) - 1]['out'] = $formattedTime;
+                }
+            }
+
+            $auditNote = "HR Override by Admin #{$adminId}: Check-out set to {$formattedTime}. Reason: " . trim($resolutionNotes);
+            $newRemarks = !empty($record['remarks']) ? ($record['remarks'] . ' | ' . $auditNote) : $auditNote;
+
+            $autoStatus = self::getAttendanceStatus($delayMins, $earlyExitMins, $shift, true);
+            $oldStatus = ($autoStatus === 'delayed') ? 'late' : (($autoStatus === 'left_early' || $autoStatus === 'completed') ? 'present' : $autoStatus);
+            $finalStatus = !empty($attendanceStatus) ? $attendanceStatus : $autoStatus;
+
+            $upStmt = $pdo->prepare("UPDATE attendance SET 
+                check_out = ?,
+                early_exit_minutes = ?,
+                total_work_minutes = ?,
+                working_hours = ?,
+                attendance_status = ?,
+                status = ?,
+                punch_history = ?,
+                is_flagged_for_review = 0,
+                flag_reason = NULL,
+                remarks = ?,
+                updated_at = NOW()
+                WHERE id = ?");
+            $upStmt->execute([
+                $formattedTime,
+                $earlyExitMins,
+                $workData['minutes'],
+                $workData['hours_formatted'],
+                $finalStatus,
+                $oldStatus,
+                json_encode($punchHistory),
+                $newRemarks,
+                $attendanceId
+            ]);
+
+            $pdo->commit();
+
+            Security::logAudit($adminId, 'resolve_flagged_attendance', 'attendance', $attendanceId, [
+                'employee_id'   => $record['employee_id'],
+                'check_out'     => $formattedTime,
+                'working_hours' => $workData['hours_formatted'],
+                'notes'         => trim($resolutionNotes)
+            ]);
+
+            return [
+                'success'       => true,
+                'message'       => "Attendance record #{$attendanceId} resolved successfully. Check-out recorded as " . date('h:i A', strtotime($formattedTime)) . ".",
+                'working_hours' => $workData['hours_formatted']
+            ];
+        } catch (PDOException $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            error_log("adminResolveFlaggedAttendance error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Database error while resolving attendance record.'];
+        }
+    }
+
+    /**
+     * Get count of attendance records currently flagged for HR review
+     */
+    public static function getFlaggedAttendanceCount($pdo) {
+        try {
+            return (int)$pdo->query("SELECT COUNT(*) FROM attendance WHERE is_flagged_for_review = 1")->fetchColumn();
+        } catch (PDOException $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Fetch attendance records flagged for HR review
+     */
+    public static function getFlaggedAttendanceRecords($pdo, $limit = 50) {
+        try {
+            $stmt = $pdo->prepare("SELECT a.*, e.first_name, e.last_name, e.employee_id as emp_code, e.department, e.work_mode
+                FROM attendance a
+                JOIN employees e ON a.employee_id = e.id
+                WHERE a.is_flagged_for_review = 1
+                ORDER BY a.date DESC, a.id DESC LIMIT " . (int)$limit);
+            $stmt->execute();
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (PDOException $e) {
+            error_log("getFlaggedAttendanceRecords error: " . $e->getMessage());
+            return [];
+        }
+    }
 }
+
