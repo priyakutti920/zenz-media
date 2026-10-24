@@ -2247,14 +2247,23 @@ class AttendanceHelper {
         // Resolve portal base URL
         $portalBaseUrl = rtrim($options['portal_url'] ?? '', '/');
         if (empty($portalBaseUrl)) {
+            $portalBaseUrl = rtrim($_ENV['SYSTEM_URL'] ?? (getenv('SYSTEM_URL') ?: ($_ENV['APP_URL'] ?? (getenv('APP_URL') ?: ''))), '/');
+        }
+        if (empty($portalBaseUrl)) {
             try {
                 $sysUrlStmt = $pdo->query("SELECT setting_value FROM site_settings WHERE setting_key = 'system_url' LIMIT 1");
-                $portalBaseUrl = rtrim((string)$sysUrlStmt->fetchColumn(), '/');
+                $val = $sysUrlStmt->fetchColumn();
+                if ($val) $portalBaseUrl = rtrim((string)$val, '/');
             } catch (Exception $e) {
                 $portalBaseUrl = '';
             }
-            if (empty($portalBaseUrl)) {
-                $portalBaseUrl = 'http://localhost';
+        }
+        if (empty($portalBaseUrl)) {
+            if (!empty($_SERVER['HTTP_HOST'])) {
+                $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443);
+                $portalBaseUrl = ($isHttps ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'];
+            } else {
+                $portalBaseUrl = 'https://portal.cloudaspire.in';
             }
         }
 
