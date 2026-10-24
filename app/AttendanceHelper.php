@@ -1416,5 +1416,217 @@ class AttendanceHelper {
             return [];
         }
     }
+
+    /**
+     * Format a recent attendance record for UI presentation across desktop table and mobile cards.
+     * Evaluates all 8 required columns: Date, Status, Scheduled Shift, Check In, Check Out,
+     * Working Hours, Location Info, and Daily Summary.
+     *
+     * @param array $row Attendance record with joined shift, requests, and summaries
+     * @param bool $isPortalClosedToday Whether today's attendance portal is closed
+     * @param string|null $today Today's date (defaults to current date in Asia/Kolkata)
+     * @return array
+     */
+    public static function formatRecentAttendanceRecord(array $row, bool $isPortalClosedToday = false, ?string $today = null): array {
+        if ($today === null) {
+            $today = date('Y-m-d');
+        }
+
+        // 1. Date
+        $attDate = $row['date'] ?? $today;
+        $formattedDate = date('D, M j, Y', strtotime($attDate));
+
+        // Check overnight shift
+        $isOvernight = false;
+        if (!empty($row['resolved_checkin_start']) && !empty($row['resolved_checkout_time'])) {
+            if (strtotime($row['resolved_checkout_time']) < strtotime($row['resolved_checkin_start'])) {
+                $isOvernight = true;
+            }
+        }
+        if (!$isOvernight && !empty($row['check_in']) && !empty($row['check_out'])) {
+            if (strtotime($row['check_out']) < strtotime($row['check_in'])) {
+                $isOvernight = true;
+            }
+        }
+        $overnightNextDayShort = date('M j', strtotime($attDate . ' +1 day'));
+        $overnightNextDayLong = date('D, M j, Y', strtotime($attDate . ' +1 day'));
+
+        // 2. Status
+        if (!empty($row['is_flagged_for_review']) || !empty($row['closed_by_system']) || ($row['attendance_status'] ?? '') === 'pending_hr_review') {
+            $statusKey = 'pending_hr_review';
+            $statusLabel = 'Pending HR Review';
+            $statusIcon = 'fa-solid fa-triangle-exclamation';
+        } elseif (!empty($row['check_in']) && empty($row['check_out'])) {
+            if ($attDate === $today && !$isPortalClosedToday) {
+                $statusKey = 'in_progress';
+                $statusLabel = 'In Progress';
+                $statusIcon = 'fa-solid fa-spinner fa-spin';
+            } else {
+                $statusKey = 'pending_hr_review';
+                $statusLabel = 'Pending HR Review';
+                $statusIcon = 'fa-solid fa-clock-rotate-left';
+            }
+        } else {
+            $rawStatus = strtolower($row['attendance_status'] ?? ($row['status'] ?? 'present'));
+            switch ($rawStatus) {
+                case 'completed':
+                    $statusKey = 'completed';
+                    $statusLabel = 'Completed';
+                    $statusIcon = 'fa-solid fa-circle-check';
+                    break;
+                case 'delayed':
+                case 'late':
+                    $statusKey = 'delayed';
+                    $statusLabel = 'Delayed';
+                    $statusIcon = 'fa-solid fa-clock';
+                    break;
+                case 'left_early':
+                    $statusKey = 'left_early';
+                    $statusLabel = 'Left Early';
+                    $statusIcon = 'fa-solid fa-person-walking-arrow-right';
+                    break;
+                case 'half_day':
+                    $statusKey = 'half_day';
+                    $statusLabel = 'Half Day';
+                    $statusIcon = 'fa-solid fa-adjust';
+                    break;
+                case 'absent':
+                    $statusKey = 'absent';
+                    $statusLabel = 'Absent';
+                    $statusIcon = 'fa-solid fa-circle-xmark';
+                    break;
+                case 'on_leave':
+                    $statusKey = 'on_leave';
+                    $statusLabel = 'On Leave';
+                    $statusIcon = 'fa-solid fa-calendar-day';
+                    break;
+                case 'present':
+                default:
+                    if (!empty($row['check_out'])) {
+                        $statusKey = 'completed';
+                        $statusLabel = 'Completed';
+                        $statusIcon = 'fa-solid fa-circle-check';
+                    } else {
+                        $statusKey = 'present';
+                        $statusLabel = 'Present';
+                        $statusIcon = 'fa-solid fa-circle';
+                    }
+                    break;
+            }
+        }
+
+        // 3. Scheduled Shift
+        $hasSchedule = false;
+        $shiftScheduleText = 'Schedule unavailable';
+        $shiftName = $row['resolved_shift_name'] ?? 'Regular Shift';
+        $shiftExceptionMode = '';
+        if (!empty($row['resolved_checkin_start']) && !empty($row['resolved_checkout_time'])) {
+            $hasSchedule = true;
+            $shiftStartFormatted = date('h:i A', strtotime($row['resolved_checkin_start']));
+            $shiftEndFormatted = date('h:i A', strtotime($row['resolved_checkout_time']));
+            $shiftScheduleText = $shiftStartFormatted . ' – ' . $shiftEndFormatted;
+            if (!empty($row['approved_request_mode'])) {
+                $shiftExceptionMode = ($row['approved_request_mode'] === 'wfh') ? 'Approved WFH' : 'Approved Exception';
+            }
+        }
+
+        // 4. Check In
+        $hasCheckIn = !empty($row['check_in']);
+        $checkInFormatted = $hasCheckIn ? date('h:i A', strtotime($row['check_in'])) : '—';
+
+        // 5. Check Out
+        $hasCheckOut = !empty($row['check_out']);
+        if ($hasCheckOut) {
+            $checkOutFormatted = date('h:i A', strtotime($row['check_out']));
+        } elseif ($hasCheckIn) {
+            $checkOutFormatted = 'Not checked out';
+        } else {
+            $checkOutFormatted = '—';
+        }
+
+        // 6. Working Hours
+        if (!$hasCheckIn) {
+            $workingHoursDisplay = '—';
+        } elseif (!$hasCheckOut) {
+            if ($statusKey === 'in_progress') {
+                $workingHoursDisplay = 'In progress';
+            } else {
+                $workingHoursDisplay = 'Pending checkout';
+            }
+        } else {
+            $inSec = strtotime($row['date'] . ' ' . $row['check_in']);
+            $outSec = strtotime($row['date'] . ' ' . $row['check_out']);
+            if ($outSec < $inSec) {
+                $outSec = strtotime($row['date'] . ' ' . $row['check_out'] . ' +1 day');
+            }
+            $diffSec = max(0, $outSec - $inSec);
+            $hrs = floor($diffSec / 3600);
+            $mins = floor(($diffSec % 3600) / 60);
+            if ($hrs > 0 && $mins > 0) {
+                $workingHoursDisplay = "{$hrs}h {$mins}m";
+            } elseif ($hrs > 0) {
+                $workingHoursDisplay = "{$hrs}h";
+            } elseif ($mins > 0) {
+                $workingHoursDisplay = "{$mins}m";
+            } else {
+                $workingHoursDisplay = "< 1m";
+            }
+        }
+
+        // 7. Location Info
+        $locSub = '';
+        if ($row['check_in_dist'] !== null) {
+            $locType = 'verified';
+            $locText = (int)$row['check_in_dist'] . 'm from office';
+            if ($row['check_out_dist'] !== null) {
+                $locSub = 'Out: ' . (int)$row['check_out_dist'] . 'm';
+            }
+        } elseif (($row['approved_request_mode'] ?? '') === 'wfh' || (($row['employee_work_mode'] ?? '') === 'wfh' && $row['check_in_dist'] === null)) {
+            $locType = 'remote';
+            $locText = 'WFH (Remote)';
+            $locSub = 'Approved';
+        } elseif (($row['approved_request_mode'] ?? '') === 'on_site_exception') {
+            $locType = 'exception';
+            $locText = 'On-Site Exception';
+            $locSub = 'Approved';
+        } else {
+            $locType = 'missing';
+            $locText = 'GPS not recorded';
+            $locSub = '';
+        }
+
+        // 8. Daily Summary
+        $finalSummary = trim($row['final_work_summary'] ?? '');
+        $finalCompleted = trim($row['final_completed_tasks'] ?? '');
+        $finalPending = trim($row['final_pending_tasks'] ?? '');
+        $hasSummary = (!empty($finalSummary) || !empty($finalCompleted) || !empty($finalPending));
+
+        return [
+            'date_formatted'        => $formattedDate,
+            'is_overnight'          => $isOvernight,
+            'overnight_next_short'  => $overnightNextDayShort,
+            'overnight_next_long'   => $overnightNextDayLong,
+            'status_key'            => $statusKey,
+            'status_label'          => $statusLabel,
+            'status_icon'           => $statusIcon,
+            'has_schedule'          => $hasSchedule,
+            'shift_schedule_text'   => $shiftScheduleText,
+            'shift_name'            => $shiftName,
+            'shift_exception_mode'  => $shiftExceptionMode,
+            'has_check_in'          => $hasCheckIn,
+            'check_in_formatted'    => $checkInFormatted,
+            'has_check_out'         => $hasCheckOut,
+            'check_out_formatted'   => $checkOutFormatted,
+            'working_hours_display' => $workingHoursDisplay,
+            'loc_type'              => $locType,
+            'loc_text'              => $locText,
+            'loc_sub'               => $locSub,
+            'has_summary'           => $hasSummary,
+            'final_work_summary'    => $finalSummary,
+            'final_completed_tasks' => $finalCompleted,
+            'final_pending_tasks'   => $finalPending,
+        ];
+    }
 }
+
 
