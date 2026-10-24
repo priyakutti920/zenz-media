@@ -914,6 +914,8 @@ class AttendanceHelper {
                 $pdo->exec("ALTER TABLE `attendance_requests` ADD COLUMN `approved_check_out_time` TIME DEFAULT NULL AFTER `approved_check_in_time`");
             }
 
+            self::ensureAutomatedCheckoutSchema($pdo);
+
             $ensured = true;
         } catch (PDOException $e) {
             error_log("ensurePortalClosureSchema notice: " . $e->getMessage());
@@ -1093,6 +1095,22 @@ class AttendanceHelper {
                 $flagReason = "Missing check-out before scheduled shift cutoff ({$window['end_formatted']})";
                 self::flagAttendanceForReview($pdo, $activeOpenRec['id'], $flagReason);
 
+                // Transition status to summary_pending for email summary workflow
+                if (($activeOpenRec['attendance_status'] ?? '') !== 'completed') {
+                    $pdo->prepare("UPDATE attendance SET attendance_status = 'summary_pending' WHERE id = ? AND (attendance_status IS NULL OR attendance_status != 'completed')")
+                        ->execute([$activeOpenRec['id']]);
+                    $activeOpenRec['attendance_status'] = 'summary_pending';
+                }
+
+                // Ensure summary token exists
+                $tokenInfo = self::generateDailySummaryToken(
+                    $pdo,
+                    $activeOpenRec['id'],
+                    $employeeId,
+                    $workdayDate,
+                    $shift['checkout_time']
+                );
+
                 // Reload flagged state
                 $activeOpenRec['is_flagged_for_review'] = 1;
                 $activeOpenRec['flag_reason'] = $flagReason;
@@ -1107,9 +1125,11 @@ class AttendanceHelper {
                     'seconds_remaining'       => 0,
                     'time_remaining_text'     => '00h 00m 00s',
                     'message'                 => 'Your scheduled work hours have ended. Attendance access is now closed for today.',
-                    'details'                 => "Your scheduled shift ended at {$window['end_formatted']}. Since check-out was not completed prior to the cutoff, your attendance session has been locked and flagged for HR review. Your actual check-in data has been safely preserved.",
+                    'details'                 => "Your scheduled shift ended at {$window['end_formatted']}. Since check-out was not completed prior to the cutoff, your attendance session has been locked. Please complete your Daily Work Summary to finalize your attendance.",
                     'needs_hr_review'         => true,
                     'flag_reason'             => $flagReason,
+                    'summary_pending'         => true,
+                    'token_info'              => $tokenInfo,
                     'attendance_record'       => $activeOpenRec,
                     'shift'                   => $shift,
                     'shift_window'            => $window,
@@ -1452,7 +1472,12 @@ class AttendanceHelper {
         $overnightNextDayLong = date('D, M j, Y', strtotime($attDate . ' +1 day'));
 
         // 2. Status
-        if (!empty($row['is_flagged_for_review']) || !empty($row['closed_by_system']) || ($row['attendance_status'] ?? '') === 'pending_hr_review') {
+        $rawAttStatus = strtolower($row['attendance_status'] ?? '');
+        if ($rawAttStatus === 'summary_pending') {
+            $statusKey = 'summary_pending';
+            $statusLabel = 'Summary Pending';
+            $statusIcon = 'fa-solid fa-file-pen';
+        } elseif (!empty($row['is_flagged_for_review']) || ($row['attendance_status'] ?? '') === 'pending_hr_review') {
             $statusKey = 'pending_hr_review';
             $statusLabel = 'Pending HR Review';
             $statusIcon = 'fa-solid fa-triangle-exclamation';
@@ -1536,8 +1561,13 @@ class AttendanceHelper {
 
         // 5. Check Out
         $hasCheckOut = !empty($row['check_out']);
+        $isScheduledAuto = (($row['checkout_type'] ?? '') === 'scheduled_auto');
+        $checkoutNote = $isScheduledAuto ? '(Auto - Scheduled)' : '';
+
         if ($hasCheckOut) {
             $checkOutFormatted = date('h:i A', strtotime($row['check_out']));
+        } elseif ($statusKey === 'summary_pending') {
+            $checkOutFormatted = 'Pending Summary';
         } elseif ($hasCheckIn) {
             $checkOutFormatted = 'Not checked out';
         } else {
@@ -1547,6 +1577,8 @@ class AttendanceHelper {
         // 6. Working Hours
         if (!$hasCheckIn) {
             $workingHoursDisplay = '—';
+        } elseif ($statusKey === 'summary_pending') {
+            $workingHoursDisplay = 'Pending summary';
         } elseif (!$hasCheckOut) {
             if ($statusKey === 'in_progress') {
                 $workingHoursDisplay = 'In progress';
@@ -1617,6 +1649,11 @@ class AttendanceHelper {
             'check_in_formatted'    => $checkInFormatted,
             'has_check_out'         => $hasCheckOut,
             'check_out_formatted'   => $checkOutFormatted,
+            'is_scheduled_auto'     => $isScheduledAuto,
+            'checkout_type'         => $row['checkout_type'] ?? 'manual',
+            'checkout_note'         => $checkoutNote,
+            'scheduled_checkout'    => $row['scheduled_checkout'] ?? null,
+            'summary_submitted_at'  => $row['summary_submitted_at'] ?? null,
             'working_hours_display' => $workingHoursDisplay,
             'loc_type'              => $locType,
             'loc_text'              => $locText,
@@ -1626,6 +1663,772 @@ class AttendanceHelper {
             'final_completed_tasks' => $finalCompleted,
             'final_pending_tasks'   => $finalPending,
         ];
+    }
+
+    // =========================================================================
+    // AUTOMATED SHIFT CHECKOUT WITH EMAIL-BASED DAILY WORK SUMMARY METHODS
+    // =========================================================================
+
+    /**
+     * Safe, idempotent schema check to guarantee automated checkout and summary token tables/columns exist.
+     */
+    public static function ensureAutomatedCheckoutSchema($pdo) {
+        static $ensured = false;
+        if ($ensured) return;
+
+        try {
+            // 1. Ensure attendance columns
+            $cols = $pdo->query("SHOW COLUMNS FROM `attendance`")->fetchAll(PDO::FETCH_COLUMN);
+            if (!in_array('checkout_type', $cols, true)) {
+                $pdo->exec("ALTER TABLE `attendance` ADD COLUMN `checkout_type` VARCHAR(30) DEFAULT 'manual' AFTER `check_out`");
+            }
+            if (!in_array('scheduled_checkout', $cols, true)) {
+                $pdo->exec("ALTER TABLE `attendance` ADD COLUMN `scheduled_checkout` TIME DEFAULT NULL AFTER `checkout_type`");
+            }
+            if (!in_array('summary_submitted_at', $cols, true)) {
+                $pdo->exec("ALTER TABLE `attendance` ADD COLUMN `summary_submitted_at` DATETIME DEFAULT NULL AFTER `scheduled_checkout`");
+            }
+
+            // Ensure attendance_status allows VARCHAR(50) so 'summary_pending' fits
+            $colDefs = $pdo->query("SHOW COLUMNS FROM `attendance` LIKE 'attendance_status'")->fetch(PDO::FETCH_ASSOC);
+            if ($colDefs && strpos(strtolower($colDefs['Type']), 'varchar') === false) {
+                $pdo->exec("ALTER TABLE `attendance` MODIFY COLUMN `attendance_status` VARCHAR(50) DEFAULT 'present'");
+            }
+
+            // 2. Ensure daily_work_summaries columns
+            $sumCols = $pdo->query("SHOW COLUMNS FROM `daily_work_summaries`")->fetchAll(PDO::FETCH_COLUMN);
+            if (!in_array('additional_notes', $sumCols, true)) {
+                $pdo->exec("ALTER TABLE `daily_work_summaries` ADD COLUMN `additional_notes` TEXT DEFAULT NULL AFTER `pending_tasks`");
+            }
+            if (!in_array('submission_source', $sumCols, true)) {
+                $pdo->exec("ALTER TABLE `daily_work_summaries` ADD COLUMN `submission_source` VARCHAR(30) DEFAULT 'modal' AFTER `additional_notes`");
+            }
+            if (!in_array('submitted_at', $sumCols, true)) {
+                $pdo->exec("ALTER TABLE `daily_work_summaries` ADD COLUMN `submitted_at` DATETIME DEFAULT NULL AFTER `submission_source`");
+            }
+
+            // 3. Ensure attendance_summary_tokens table
+            $pdo->exec("CREATE TABLE IF NOT EXISTS `attendance_summary_tokens` (
+                `id` INT AUTO_INCREMENT PRIMARY KEY,
+                `attendance_id` INT NOT NULL UNIQUE,
+                `employee_id` INT NOT NULL,
+                `shift_date` DATE NOT NULL,
+                `scheduled_checkout_time` TIME NOT NULL,
+                `token_hash` VARCHAR(64) NOT NULL UNIQUE,
+                `status` ENUM('pending', 'completed', 'expired', 'cancelled') NOT NULL DEFAULT 'pending',
+                `email_sent` TINYINT(1) NOT NULL DEFAULT 0,
+                `email_sent_at` DATETIME DEFAULT NULL,
+                `email_delivery_status` ENUM('pending', 'sent', 'failed') NOT NULL DEFAULT 'pending',
+                `email_error_message` VARCHAR(255) DEFAULT NULL,
+                `email_attempts` INT NOT NULL DEFAULT 0,
+                `last_reminder_sent_at` DATETIME DEFAULT NULL,
+                `reminder_count` INT NOT NULL DEFAULT 0,
+                `expires_at` DATETIME NOT NULL,
+                `completed_at` DATETIME DEFAULT NULL,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX `idx_token_hash` (`token_hash`),
+                INDEX `idx_emp_date` (`employee_id`, `shift_date`),
+                INDEX `idx_status_expires` (`status`, `expires_at`),
+                INDEX `idx_email_pending` (`status`, `email_sent`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+
+            $ensured = true;
+        } catch (PDOException $e) {
+            error_log("ensureAutomatedCheckoutSchema notice: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Generate a cryptographically secure, single-use, expiring token for the Daily Work Summary email form.
+     * Stores only the SHA-256 hash of the token in the database.
+     * Binds token to employee, attendance record, and shift date.
+     *
+     * @param PDO $pdo
+     * @param int $attendanceId
+     * @param int $employeeId
+     * @param string $shiftDate
+     * @param string $scheduledCheckoutTime
+     * @param int $expiresHours Default 48 hours
+     * @return array ['success' => bool, 'plain_token' => string, 'token_record' => array]
+     */
+    public static function generateDailySummaryToken($pdo, $attendanceId, $employeeId, $shiftDate, $scheduledCheckoutTime, $expiresHours = 48) {
+        self::ensureAutomatedCheckoutSchema($pdo);
+
+        $plainToken = bin2hex(random_bytes(32)); // 64 hex characters
+        $tokenHash = hash('sha256', $plainToken);
+        $expiresAt = date('Y-m-d H:i:s', time() + ($expiresHours * 3600));
+
+        // Format scheduled checkout time to H:i:s
+        $formattedSchedTime = date('H:i:00', strtotime($scheduledCheckoutTime));
+
+        try {
+            // Check if token row already exists for this attendance record
+            $checkStmt = $pdo->prepare("SELECT * FROM attendance_summary_tokens WHERE attendance_id = ? LIMIT 1");
+            $checkStmt->execute([(int)$attendanceId]);
+            $existing = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($existing) {
+                if ($existing['status'] === 'completed') {
+                    return [
+                        'success'           => true,
+                        'already_completed' => true,
+                        'plain_token'       => null,
+                        'token_hash'        => $existing['token_hash'],
+                        'token_record'      => $existing
+                    ];
+                }
+
+                // If pending, rotate with new hash and refreshed expiration
+                $upStmt = $pdo->prepare("UPDATE attendance_summary_tokens SET 
+                    token_hash = ?, 
+                    scheduled_checkout_time = ?,
+                    expires_at = ?, 
+                    status = 'pending',
+                    updated_at = NOW() 
+                    WHERE id = ?");
+                $upStmt->execute([$tokenHash, $formattedSchedTime, $expiresAt, $existing['id']]);
+
+                $existing['token_hash'] = $tokenHash;
+                $existing['expires_at'] = $expiresAt;
+                $existing['scheduled_checkout_time'] = $formattedSchedTime;
+
+                return [
+                    'success'      => true,
+                    'plain_token'  => $plainToken,
+                    'token_hash'   => $tokenHash,
+                    'token_id'     => (int)$existing['id'],
+                    'token_record' => $existing
+                ];
+            }
+
+            // Insert new token record
+            $insStmt = $pdo->prepare("INSERT INTO attendance_summary_tokens 
+                (attendance_id, employee_id, shift_date, scheduled_checkout_time, token_hash, status, email_sent, expires_at) 
+                VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)");
+            $insStmt->execute([
+                (int)$attendanceId,
+                (int)$employeeId,
+                $shiftDate,
+                $formattedSchedTime,
+                $tokenHash,
+                $expiresAt
+            ]);
+            $newId = (int)$pdo->lastInsertId();
+
+            return [
+                'success'      => true,
+                'plain_token'  => $plainToken,
+                'token_hash'   => $tokenHash,
+                'token_id'     => $newId,
+                'token_record' => [
+                    'id'                      => $newId,
+                    'attendance_id'           => (int)$attendanceId,
+                    'employee_id'             => (int)$employeeId,
+                    'shift_date'              => $shiftDate,
+                    'scheduled_checkout_time' => $formattedSchedTime,
+                    'token_hash'              => $tokenHash,
+                    'status'                  => 'pending',
+                    'email_sent'              => 0,
+                    'expires_at'              => $expiresAt
+                ]
+            ];
+        } catch (PDOException $e) {
+            error_log("generateDailySummaryToken error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Database error generating summary token.'];
+        }
+    }
+
+    /**
+     * Validate a plain summary token.
+     * Computes SHA-256 hash, verifies expiration, and checks status.
+     *
+     * @param PDO $pdo
+     * @param string $plainToken
+     * @return array
+     */
+    public static function validateDailySummaryToken($pdo, $plainToken) {
+        self::ensureAutomatedCheckoutSchema($pdo);
+
+        $plainToken = trim((string)$plainToken);
+        if (empty($plainToken) || strlen($plainToken) < 16) {
+            return ['valid' => false, 'error' => 'Invalid or missing summary authentication token.'];
+        }
+
+        $tokenHash = hash('sha256', $plainToken);
+
+        try {
+            $stmt = $pdo->prepare("SELECT t.*, 
+                e.first_name, e.last_name, e.employee_id AS emp_code, e.email, e.department, e.work_mode,
+                a.date AS attendance_date, a.check_in, a.check_out, a.checkout_type, a.attendance_status,
+                a.work_summary, a.completed_tasks, a.pending_tasks
+                FROM attendance_summary_tokens t
+                JOIN employees e ON t.employee_id = e.id
+                JOIN attendance a ON t.attendance_id = a.id
+                WHERE t.token_hash = ?
+                LIMIT 1");
+            $stmt->execute([$tokenHash]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$row) {
+                return ['valid' => false, 'error' => 'Invalid or unrecognized summary access link.'];
+            }
+
+            if ($row['status'] === 'completed' || !empty($row['completed_at'])) {
+                return [
+                    'valid'             => false,
+                    'already_completed' => true,
+                    'error'             => 'This daily work summary has already been completed and attendance finalized.',
+                    'token_record'      => $row
+                ];
+            }
+
+            // Expiration check
+            $expiresTs = strtotime($row['expires_at']);
+            if ($row['status'] === 'expired' || ($expiresTs !== false && time() > $expiresTs)) {
+                if ($row['status'] !== 'expired') {
+                    $up = $pdo->prepare("UPDATE attendance_summary_tokens SET status = 'expired' WHERE id = ?");
+                    $up->execute([$row['id']]);
+                }
+                return [
+                    'valid'        => false,
+                    'expired'      => true,
+                    'error'        => 'This summary link has expired. Please contact HR or request a new summary link.',
+                    'token_record' => $row
+                ];
+            }
+
+            if ($row['status'] === 'cancelled') {
+                return [
+                    'valid'        => false,
+                    'error'        => 'This summary submission link has been cancelled.',
+                    'token_record' => $row
+                ];
+            }
+
+            return [
+                'valid'        => true,
+                'token_record' => $row,
+                'employee'     => [
+                    'id'         => (int)$row['employee_id'],
+                    'first_name' => $row['first_name'],
+                    'last_name'  => $row['last_name'],
+                    'emp_code'   => $row['emp_code'],
+                    'email'      => $row['email'],
+                    'department' => $row['department'],
+                    'work_mode'  => $row['work_mode']
+                ],
+                'attendance'   => [
+                    'id'                => (int)$row['attendance_id'],
+                    'date'              => $row['attendance_date'],
+                    'check_in'          => $row['check_in'],
+                    'check_out'         => $row['check_out'],
+                    'checkout_type'     => $row['checkout_type'],
+                    'attendance_status' => $row['attendance_status']
+                ]
+            ];
+        } catch (PDOException $e) {
+            error_log("validateDailySummaryToken error: " . $e->getMessage());
+            return ['valid' => false, 'error' => 'Database error validating summary token.'];
+        }
+    }
+
+    /**
+     * Retrieve token row by attendance ID
+     */
+    public static function getSummaryTokenByAttendanceId($pdo, $attendanceId) {
+        try {
+            $stmt = $pdo->prepare("SELECT * FROM attendance_summary_tokens WHERE attendance_id = ? LIMIT 1");
+            $stmt->execute([(int)$attendanceId]);
+            return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        } catch (PDOException $e) {
+            error_log("getSummaryTokenByAttendanceId error: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Finalize automated shift checkout upon valid Daily Work Summary submission.
+     * Enforces:
+     * - Automatic checkout finalized using scheduled shift checkout time (never email submission time).
+     * - Preserves actual checkout time if employee checked out before cutoff.
+     * - Records actual summary submission timestamp separately (summary_submitted_at).
+     * - Sets checkout_type = 'scheduled_auto' when auto cutoff is used.
+     * - Marks attendance as 'completed' without requiring HR review.
+     * - Invalidates single-use token to prevent replay attacks and duplicate submissions.
+     * - IDOR protection against unauthorized submissions.
+     *
+     * @param PDO $pdo
+     * @param string|int $tokenOrAttendanceId Plain token string or attendance ID (when isDirectAttendanceId=true)
+     * @param array $summaryData Form input: tasks_worked, tasks_completed, pending_tasks, additional_notes
+     * @param int|null $submittedByEmployeeId Optional authenticated employee ID to prevent IDOR
+     * @param bool $isDirectAttendanceId Set true if passing attendance ID directly (e.g. from authenticated session)
+     * @return array
+     */
+    public static function finalizeAutomatedShiftCheckoutWithSummary($pdo, $tokenOrAttendanceId, array $summaryData, $submittedByEmployeeId = null, $isDirectAttendanceId = false) {
+        self::ensureAutomatedCheckoutSchema($pdo);
+
+        // Sanitize & Validate required summary fields
+        $tasksWorked     = trim($summaryData['tasks_worked'] ?? ($summaryData['work_summary'] ?? ''));
+        $tasksCompleted  = trim($summaryData['tasks_completed'] ?? ($summaryData['completed_tasks'] ?? ''));
+        $pendingTasks    = trim($summaryData['pending_tasks'] ?? '');
+        $additionalNotes = trim($summaryData['additional_notes'] ?? ($summaryData['notes'] ?? ''));
+
+        if (empty($tasksWorked) || empty($tasksCompleted)) {
+            return [
+                'success' => false,
+                'error'   => 'Both "Tasks Worked On" and "Tasks Completed Today" are mandatory fields.'
+            ];
+        }
+
+        try {
+            $pdo->beginTransaction();
+
+            $tokenRow = null;
+            $attendanceId = null;
+
+            if (!$isDirectAttendanceId) {
+                // Token-based submission: validate token row
+                $tokenHash = hash('sha256', trim((string)$tokenOrAttendanceId));
+                $tokenStmt = $pdo->prepare("SELECT * FROM attendance_summary_tokens WHERE token_hash = ? FOR UPDATE");
+                $tokenStmt->execute([$tokenHash]);
+                $tokenRow = $tokenStmt->fetch(PDO::FETCH_ASSOC);
+
+                if (!$tokenRow) {
+                    $pdo->rollBack();
+                    return ['success' => false, 'error' => 'Invalid or unrecognized summary access token.'];
+                }
+
+                if ($tokenRow['status'] === 'completed') {
+                    $pdo->rollBack();
+                    return ['success' => false, 'error' => 'This summary has already been completed and finalized. Replay submission rejected.'];
+                }
+
+                if ($tokenRow['status'] === 'expired' || strtotime($tokenRow['expires_at']) < time()) {
+                    $pdo->rollBack();
+                    return ['success' => false, 'error' => 'This summary link has expired.'];
+                }
+
+                $attendanceId = (int)$tokenRow['attendance_id'];
+            } else {
+                $attendanceId = (int)$tokenOrAttendanceId;
+                // Lock associated token row if exists
+                $tokenStmt = $pdo->prepare("SELECT * FROM attendance_summary_tokens WHERE attendance_id = ? FOR UPDATE");
+                $tokenStmt->execute([$attendanceId]);
+                $tokenRow = $tokenStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+
+                if ($tokenRow && $tokenRow['status'] === 'completed') {
+                    $pdo->rollBack();
+                    return ['success' => false, 'error' => 'This summary has already been completed.'];
+                }
+            }
+
+            // Lock attendance record
+            $attStmt = $pdo->prepare("SELECT * FROM attendance WHERE id = ? FOR UPDATE");
+            $attStmt->execute([$attendanceId]);
+            $attendance = $attStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$attendance) {
+                $pdo->rollBack();
+                return ['success' => false, 'error' => 'Attendance record not found.'];
+            }
+
+            // IDOR Protection: verify employee matches
+            if ($submittedByEmployeeId !== null && (int)$attendance['employee_id'] !== (int)$submittedByEmployeeId) {
+                $pdo->rollBack();
+                return ['success' => false, 'error' => 'Access Denied: You cannot submit a work summary for another employee.'];
+            }
+            if ($tokenRow && (int)$attendance['employee_id'] !== (int)$tokenRow['employee_id']) {
+                $pdo->rollBack();
+                return ['success' => false, 'error' => 'Token binding mismatch with attendance employee.'];
+            }
+
+            $employeeId = (int)$attendance['employee_id'];
+            $attendanceDate = $attendance['date'];
+            $nowTimestamp = date('Y-m-d H:i:s');
+
+            // Resolve scheduled shift for this employee & date
+            $shift = self::getEmployeeShift($pdo, $employeeId, $attendanceDate);
+            $scheduledCutoffTime = $tokenRow['scheduled_checkout_time'] ?? ($shift['checkout_time'] ?? '17:00:00');
+            $scheduledCutoffFormatted = date('H:i:00', strtotime($scheduledCutoffTime));
+
+            // Checkout Timestamp Rules:
+            // "Never overwrite an existing valid checkout timestamp. If the employee has already checked out before the cutoff, preserve the actual checkout time and attach the summary to that attendance record."
+            // "Once a valid summary is submitted, finalize checkout using the scheduled shift cutoff timestamp, not the email submission time."
+            $hasExistingCheckout = !empty($attendance['check_out']);
+
+            if ($hasExistingCheckout) {
+                $finalCheckout = $attendance['check_out'];
+                $checkoutType = !empty($attendance['checkout_type']) ? $attendance['checkout_type'] : 'manual';
+                $scheduledCheckoutCol = !empty($attendance['scheduled_checkout']) ? $attendance['scheduled_checkout'] : $scheduledCutoffFormatted;
+                $punchHistory = json_decode($attendance['punch_history'] ?? '[]', true) ?: [];
+                $totalMinutes = (int)($attendance['total_work_minutes'] ?? 0);
+                $workHours = (float)($attendance['working_hours'] ?? 0);
+                $earlyExitMins = (int)($attendance['early_exit_minutes'] ?? 0);
+            } else {
+                // Missing checkout: use scheduled shift cutoff timestamp!
+                $finalCheckout = $scheduledCutoffFormatted;
+                $checkoutType = 'scheduled_auto';
+                $scheduledCheckoutCol = $scheduledCutoffFormatted;
+                $earlyExitMins = 0; // Cutoff met
+
+                // Update punch history
+                $punchHistory = json_decode($attendance['punch_history'] ?? '[]', true) ?: [];
+                $openSlotFound = false;
+                foreach ($punchHistory as &$p) {
+                    if (empty($p['out'])) {
+                        $p['out'] = $finalCheckout;
+                        $openSlotFound = true;
+                        break;
+                    }
+                }
+                unset($p);
+
+                if (!$openSlotFound) {
+                    $punchHistory[] = [
+                        'in'  => $attendance['check_in'] ?: ($shift['checkin_start'] ?? '09:00:00'),
+                        'out' => $finalCheckout
+                    ];
+                }
+
+                // Calculate working hours between check_in and scheduled cutoff
+                $totalMinutes = 0;
+                foreach ($punchHistory as $p) {
+                    if (!empty($p['in']) && !empty($p['out'])) {
+                        $inSec = strtotime($attendanceDate . ' ' . $p['in']);
+                        $outSec = strtotime($attendanceDate . ' ' . $p['out']);
+                        if ($outSec < $inSec) {
+                            $outSec += 86400; // Overnight
+                        }
+                        $totalMinutes += max(0, (int)round(($outSec - $inSec) / 60));
+                    }
+                }
+                $workHours = round($totalMinutes / 60, 2);
+            }
+
+            // Attendance is finalized consistently without requiring HR review
+            $finalAttendanceStatus = 'completed';
+            $finalLegacyStatus = 'present';
+
+            // 1. Update attendance table
+            $upAttStmt = $pdo->prepare("UPDATE attendance SET 
+                check_out             = ?,
+                checkout_type         = ?,
+                scheduled_checkout    = ?,
+                summary_submitted_at  = ?,
+                early_exit_minutes    = ?,
+                total_work_minutes    = ?,
+                working_hours         = ?,
+                attendance_status     = ?,
+                status                = ?,
+                punch_history         = ?,
+                work_summary          = ?,
+                completed_tasks       = ?,
+                pending_tasks         = ?,
+                is_flagged_for_review = 0,
+                flag_reason           = NULL,
+                closed_by_system      = 1,
+                updated_at            = NOW()
+                WHERE id = ?");
+
+            $upAttStmt->execute([
+                $finalCheckout,
+                $checkoutType,
+                $scheduledCheckoutCol,
+                $nowTimestamp,
+                $earlyExitMins,
+                $totalMinutes,
+                $workHours,
+                $finalAttendanceStatus,
+                $finalLegacyStatus,
+                json_encode($punchHistory),
+                $tasksWorked,
+                $tasksCompleted,
+                $pendingTasks ?: null,
+                $attendanceId
+            ]);
+
+            // 2. Insert or update daily_work_summaries table
+            $submissionSource = $isDirectAttendanceId ? 'modal' : 'email_token';
+            $insDwsStmt = $pdo->prepare("INSERT INTO daily_work_summaries 
+                (attendance_id, employee_id, date, work_summary, completed_tasks, pending_tasks, additional_notes, submission_source, submitted_at) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE 
+                work_summary      = VALUES(work_summary), 
+                completed_tasks   = VALUES(completed_tasks), 
+                pending_tasks     = VALUES(pending_tasks),
+                additional_notes  = VALUES(additional_notes),
+                submission_source = VALUES(submission_source),
+                submitted_at      = VALUES(submitted_at),
+                updated_at        = NOW()");
+
+            $insDwsStmt->execute([
+                $attendanceId,
+                $employeeId,
+                $attendanceDate,
+                $tasksWorked,
+                $tasksCompleted,
+                $pendingTasks ?: null,
+                $additionalNotes ?: null,
+                $submissionSource,
+                $nowTimestamp
+            ]);
+
+            // 3. Invalidate token record if present
+            if ($tokenRow) {
+                $upTokenStmt = $pdo->prepare("UPDATE attendance_summary_tokens SET 
+                    status       = 'completed', 
+                    completed_at = NOW(), 
+                    updated_at   = NOW() 
+                    WHERE id = ?");
+                $upTokenStmt->execute([$tokenRow['id']]);
+            }
+
+            $pdo->commit();
+
+            // Audit log
+            Security::logAudit($employeeId, 'automated_shift_summary_submitted', 'attendance', $attendanceId, [
+                'checkout_type'        => $checkoutType,
+                'final_checkout'       => $finalCheckout,
+                'scheduled_checkout'   => $scheduledCheckoutCol,
+                'summary_submitted_at' => $nowTimestamp,
+                'working_hours'        => $workHours
+            ]);
+
+            return [
+                'success'              => true,
+                'message'              => 'Daily work summary submitted successfully. Your attendance for this shift has been finalized.',
+                'attendance_id'        => $attendanceId,
+                'employee_id'          => $employeeId,
+                'date'                 => $attendanceDate,
+                'check_in'             => $attendance['check_in'],
+                'check_out'            => $finalCheckout,
+                'checkout_type'        => $checkoutType,
+                'working_hours'        => $workHours,
+                'summary_submitted_at' => $nowTimestamp,
+                'attendance_status'    => $finalAttendanceStatus
+            ];
+        } catch (PDOException $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            error_log("finalizeAutomatedShiftCheckoutWithSummary error: " . $e->getMessage());
+            return ['success' => false, 'error' => 'Database error while finalizing automated attendance summary.'];
+        }
+    }
+
+    /**
+     * Automated Scheduler Processor:
+     * 1. Detects employees whose scheduled shift checkout cutoff has been reached.
+     * 2. Automatically closes check-in/out actions for that shift and transitions open attendance to 'summary_pending'.
+     * 3. Generates a secure single-use expiring token.
+     * 4. Dispatches the summary request email to the employee's registered email address.
+     * 5. Sends reminders according to configurable policy without sending duplicate emails.
+     * 6. Concurrency-safe and idempotent for repeated scheduler runs.
+     *
+     * @param PDO $pdo
+     * @param array $options ['timestamp', 'date', 'portal_url', 'send_email', 'reminder_hours', 'max_reminders']
+     * @return array Processing summary statistics
+     */
+    public static function processShiftCutoffsAndSendSummaryEmails($pdo, array $options = []) {
+        self::ensureAutomatedCheckoutSchema($pdo);
+
+        if (date_default_timezone_get() !== 'Asia/Kolkata') {
+            date_default_timezone_set('Asia/Kolkata');
+        }
+
+        $currentTs = $options['timestamp'] ?? time();
+        $todayDate = $options['date'] ?? date('Y-m-d', $currentTs);
+        $currentTime = date('H:i:s', $currentTs);
+        $sendEmail = $options['send_email'] ?? true;
+        $reminderIntervalHours = (int)($options['reminder_hours'] ?? 2);
+        $maxReminders = (int)($options['max_reminders'] ?? 2);
+
+        // Resolve portal base URL
+        $portalBaseUrl = rtrim($options['portal_url'] ?? '', '/');
+        if (empty($portalBaseUrl)) {
+            try {
+                $sysUrlStmt = $pdo->query("SELECT setting_value FROM site_settings WHERE setting_key = 'system_url' LIMIT 1");
+                $portalBaseUrl = rtrim((string)$sysUrlStmt->fetchColumn(), '/');
+            } catch (Exception $e) {
+                $portalBaseUrl = '';
+            }
+            if (empty($portalBaseUrl)) {
+                $portalBaseUrl = 'http://localhost';
+            }
+        }
+
+        $stats = [
+            'scanned'        => 0,
+            'cutoff_reached' => 0,
+            'tokens_created' => 0,
+            'emails_sent'    => 0,
+            'emails_failed'  => 0,
+            'reminders_sent' => 0,
+            'skipped'        => 0,
+            'errors'         => []
+        ];
+
+        try {
+            // Find candidate attendance records for today AND active overnight records from yesterday
+            // Criteria: check_in IS NOT NULL AND attendance_status != 'completed'
+            $yesterdayDate = date('Y-m-d', strtotime('-1 day', strtotime($todayDate)));
+
+            $sql = "SELECT a.*, e.first_name, e.last_name, e.email, e.shift_id, e.work_mode
+                    FROM attendance a
+                    JOIN employees e ON a.employee_id = e.id
+                    WHERE a.date IN (?, ?)
+                    AND a.check_in IS NOT NULL
+                    AND (a.attendance_status IS NULL OR a.attendance_status != 'completed')
+                    AND e.status = 'active'";
+
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$todayDate, $yesterdayDate]);
+            $candidates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($candidates as $candidate) {
+                $stats['scanned']++;
+                $empId = (int)$candidate['employee_id'];
+                $attId = (int)$candidate['id'];
+                $attDate = $candidate['date'];
+
+                // Get resolved shift policy
+                $shift = self::getEmployeeShift($pdo, $empId, $attDate);
+                $window = self::getShiftWindowForWorkday($shift, $attDate);
+                $cutoffTs = $window['end_ts'];
+
+                // Check if scheduled checkout cutoff has been reached
+                if ($currentTs < $cutoffTs) {
+                    $stats['skipped']++;
+                    continue; // Cutoff not arrived yet
+                }
+
+                $stats['cutoff_reached']++;
+
+                // Lock token row to avoid concurrent duplicate processing
+                $tokStmt = $pdo->prepare("SELECT * FROM attendance_summary_tokens WHERE attendance_id = ? FOR UPDATE");
+                $tokStmt->execute([$attId]);
+                $existingToken = $tokStmt->fetch(PDO::FETCH_ASSOC);
+
+                if ($existingToken && $existingToken['status'] === 'completed') {
+                    $stats['skipped']++;
+                    continue; // Already submitted
+                }
+
+                // 1. Automatically close normal actions and set attendance to 'summary_pending'
+                $pdo->prepare("UPDATE attendance SET 
+                    attendance_status = 'summary_pending',
+                    closed_by_system  = 1,
+                    is_flagged_for_review = 0,
+                    flag_reason       = NULL,
+                    updated_at        = NOW()
+                    WHERE id = ? AND (attendance_status IS NULL OR attendance_status != 'completed')")
+                    ->execute([$attId]);
+
+                // 2. Generate or retrieve token
+                $plainToken = null;
+                $isNewToken = false;
+                $isReminder = false;
+
+                if (!$existingToken) {
+                    $genResult = self::generateDailySummaryToken($pdo, $attId, $empId, $attDate, $shift['checkout_time']);
+                    if (!$genResult['success']) {
+                        $stats['errors'][] = "Failed generating token for attendance #{$attId}";
+                        continue;
+                    }
+                    $plainToken = $genResult['plain_token'];
+                    $existingToken = $genResult['token_record'];
+                    $stats['tokens_created']++;
+                    $isNewToken = true;
+                } elseif ((int)$existingToken['email_sent'] === 0) {
+                    // Token exists but email not sent yet (e.g. retry from previous failure)
+                    // Generate new plain token hash so URL is guaranteed valid
+                    $plainToken = bin2hex(random_bytes(32));
+                    $tokenHash = hash('sha256', $plainToken);
+                    $pdo->prepare("UPDATE attendance_summary_tokens SET token_hash = ?, updated_at = NOW() WHERE id = ?")
+                        ->execute([$tokenHash, $existingToken['id']]);
+                    $isNewToken = true;
+                } else {
+                    // Email already sent: Check reminder policy
+                    $sentTs = strtotime($existingToken['email_sent_at'] ?? '2000-01-01');
+                    $lastReminderTs = !empty($existingToken['last_reminder_sent_at']) ? strtotime($existingToken['last_reminder_sent_at']) : $sentTs;
+                    $remindersCount = (int)($existingToken['reminder_count'] ?? 0);
+
+                    $reminderDue = ($remindersCount < $maxReminders) && ($currentTs >= ($lastReminderTs + ($reminderIntervalHours * 3600)));
+
+                    if ($reminderDue) {
+                        $plainToken = bin2hex(random_bytes(32));
+                        $tokenHash = hash('sha256', $plainToken);
+                        $pdo->prepare("UPDATE attendance_summary_tokens SET token_hash = ?, updated_at = NOW() WHERE id = ?")
+                            ->execute([$tokenHash, $existingToken['id']]);
+                        $isReminder = true;
+                    } else {
+                        // Idempotency: Do not send duplicate emails
+                        $stats['skipped']++;
+                        continue;
+                    }
+                }
+
+                // 3. Dispatch Email if enabled
+                if ($sendEmail && !empty($plainToken) && !empty($candidate['email'])) {
+                    require_once __DIR__ . '/Mailer.php';
+
+                    $empName = trim($candidate['first_name'] . ' ' . $candidate['last_name']);
+                    $summaryUrl = $portalBaseUrl . '/submit_work_summary.php?token=' . urlencode($plainToken);
+                    $schedTimeFormatted = $window['end_formatted'];
+                    $shiftName = $window['shift_name'];
+
+                    $mailer = new Mailer($pdo);
+                    $mailResult = $mailer->sendDailySummaryRequestEmail(
+                        $candidate['email'],
+                        $empName,
+                        $summaryUrl,
+                        $attDate,
+                        $schedTimeFormatted,
+                        $shiftName
+                    );
+
+                    if ($mailResult['success']) {
+                        if ($isReminder) {
+                            $pdo->prepare("UPDATE attendance_summary_tokens SET 
+                                reminder_count        = reminder_count + 1,
+                                last_reminder_sent_at = NOW(),
+                                email_delivery_status = 'sent',
+                                email_attempts        = email_attempts + 1,
+                                email_error_message   = NULL,
+                                updated_at            = NOW()
+                                WHERE id = ?")->execute([$existingToken['id']]);
+                            $stats['reminders_sent']++;
+                        } else {
+                            $pdo->prepare("UPDATE attendance_summary_tokens SET 
+                                email_sent            = 1,
+                                email_sent_at         = NOW(),
+                                email_delivery_status = 'sent',
+                                email_attempts        = email_attempts + 1,
+                                email_error_message   = NULL,
+                                updated_at            = NOW()
+                                WHERE id = ?")->execute([$existingToken['id']]);
+                            $stats['emails_sent']++;
+                        }
+                    } else {
+                        $lastError = substr($mailResult['error'] ?? 'Unknown mail error', 0, 255);
+                        $pdo->prepare("UPDATE attendance_summary_tokens SET 
+                            email_delivery_status = 'failed',
+                            email_attempts        = email_attempts + 1,
+                            email_error_message   = ?,
+                            updated_at            = NOW()
+                            WHERE id = ?")->execute([$lastError, $existingToken['id']]);
+                        $stats['emails_failed']++;
+                        $stats['errors'][] = "Email to {$candidate['email']} failed: {$lastError}";
+                    }
+                }
+            }
+        } catch (PDOException $e) {
+            error_log("processShiftCutoffsAndSendSummaryEmails error: " . $e->getMessage());
+            $stats['errors'][] = $e->getMessage();
+        }
+
+        return $stats;
     }
 }
 

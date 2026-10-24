@@ -987,6 +987,25 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             color: #dc2626;
             border: 1px solid rgba(239, 68, 68, 0.3);
         }
+        .status-summary_pending {
+            background: rgba(245, 158, 11, 0.15);
+            color: #d97706;
+            border: 1px solid rgba(245, 158, 11, 0.4);
+        }
+        .badge-auto-sched {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 7px;
+            border-radius: var(--att-radius-pill);
+            font-size: 0.72rem;
+            font-weight: 700;
+            background: rgba(16, 185, 129, 0.12);
+            color: #059669;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            margin-top: 3px;
+            white-space: nowrap;
+        }
 
         .badge-overnight {
             display: inline-flex;
@@ -1555,7 +1574,9 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
                     <div class="status-title">
                         <?php if ($portalClosure['is_closed']): ?>
-                            <?php if ($portalClosure['needs_hr_review']): ?>
+                            <?php if (!empty($portalClosure['summary_pending']) || ($todaysRecord && ($todaysRecord['attendance_status'] ?? '') === 'summary_pending')): ?>
+                                Shift Cutoff Reached &bull; Daily Summary Pending
+                            <?php elseif ($portalClosure['needs_hr_review']): ?>
                                 Shift Cutoff Reached &bull; Preserved for HR Review
                             <?php elseif ($todaysRecord && !empty($todaysRecord['check_out'])): ?>
                                 Shift Concluded at <?php echo date('h:i A', strtotime($todaysRecord['check_out'])); ?>
@@ -1581,7 +1602,13 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                 <div style="font-size:0.88rem; color:var(--att-text-muted); margin-top:4px; line-height:1.45;">
                                     <?php echo htmlspecialchars($portalClosure['details']); ?>
                                 </div>
-                                <?php if ($portalClosure['needs_hr_review']): ?>
+                                <?php if (!empty($portalClosure['summary_pending']) || ($todaysRecord && ($todaysRecord['attendance_status'] ?? '') === 'summary_pending')): ?>
+                                    <div style="margin-top:8px;">
+                                        <span class="badge-status status-summary_pending" style="font-size:0.8rem; padding:4px 10px;">
+                                            <i class="fa-solid fa-file-pen"></i> Daily Summary Pending &bull; Check your email for secure submission link
+                                        </span>
+                                    </div>
+                                <?php elseif ($portalClosure['needs_hr_review']): ?>
                                     <div style="margin-top:8px;">
                                         <span class="badge-flagged-review"><i class="fa-solid fa-clock-rotate-left"></i> Flagged for HR Review &bull; Check-in preserved</span>
                                     </div>
@@ -2081,8 +2108,17 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
                                     <!-- 5. Check Out -->
                                     <td style="font-weight: 600; white-space: nowrap;">
-                                        <?php if ($disp['has_check_out']): ?>
-                                            <?php echo htmlspecialchars($disp['check_out_formatted']); ?>
+                                        <?php if ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:#d97706; font-style:italic; font-size:0.86rem;">
+                                                <i class="fa-solid fa-clock"></i> Pending Summary
+                                            </span>
+                                        <?php elseif ($disp['has_check_out']): ?>
+                                            <span><?php echo htmlspecialchars($disp['check_out_formatted']); ?></span>
+                                            <?php if (!empty($disp['is_scheduled_auto'])): ?>
+                                                <div class="badge-auto-sched" title="Finalized automatically using scheduled shift cutoff">
+                                                    <i class="fa-solid fa-robot"></i> Scheduled Auto
+                                                </div>
+                                            <?php endif; ?>
                                         <?php elseif ($disp['has_check_in']): ?>
                                             <span class="text-missing-checkout"><i class="fa-regular fa-clock"></i> Not checked out</span>
                                         <?php else: ?>
@@ -2094,6 +2130,8 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                     <td style="font-weight: 700; white-space: nowrap;">
                                         <?php if (!$disp['has_check_in']): ?>
                                             <span style="color:var(--att-text-muted);">&mdash;</span>
+                                        <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:var(--att-text-muted); font-size:0.85rem; font-style:italic;"><i class="fa-solid fa-clock"></i> Pending summary</span>
                                         <?php elseif (!$disp['has_check_out']): ?>
                                             <?php if ($disp['status_key'] === 'in_progress'): ?>
                                                 <span class="hours-in-progress"><i class="fa-solid fa-spinner fa-spin"></i> In progress</span>
@@ -2141,6 +2179,8 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                             ]), ENT_QUOTES, 'UTF-8'); ?>)">
                                                 <i class="fa-solid fa-file-lines"></i> View Summary
                                             </button>
+                                        <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:#d97706; font-size:0.82rem; font-weight:600;"><i class="fa-solid fa-pen-to-square"></i> Awaiting Summary</span>
                                         <?php else: ?>
                                             <span style="color:var(--att-text-muted); font-size:0.82rem; font-style:italic;">Not submitted</span>
                                         <?php endif; ?>
@@ -2201,8 +2241,13 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                 <div class="detail-item">
                                     <span class="detail-label">Check Out</span>
                                     <span class="detail-val" style="font-size:0.88rem; font-weight:600;">
-                                        <?php if ($disp['has_check_out']): ?>
+                                        <?php if ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:#d97706; font-size:0.78rem; font-weight:600;">Pending</span>
+                                        <?php elseif ($disp['has_check_out']): ?>
                                             <?php echo htmlspecialchars($disp['check_out_formatted']); ?>
+                                            <?php if (!empty($disp['is_scheduled_auto'])): ?>
+                                                <div class="badge-auto-sched" style="font-size:0.65rem; padding:1px 4px;">(Auto)</div>
+                                            <?php endif; ?>
                                         <?php elseif ($disp['has_check_in']): ?>
                                             <span style="color:var(--att-warning); font-size:0.78rem;">Missing</span>
                                         <?php else: ?>
@@ -2215,6 +2260,8 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                     <span class="detail-val" style="font-size:0.88rem; font-weight:700;">
                                         <?php if (!$disp['has_check_in']): ?>
                                             &mdash;
+                                        <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="font-size:0.78rem; color:#d97706;">Pending</span>
                                         <?php elseif (!$disp['has_check_out']): ?>
                                             <span style="font-size:0.78rem; color:<?php echo ($disp['status_key'] === 'in_progress' ? '#2563eb' : '#dc2626'); ?>;">
                                                 <?php echo htmlspecialchars($disp['working_hours_display']); ?>
@@ -2262,6 +2309,10 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                     ]), ENT_QUOTES, 'UTF-8'); ?>)">
                                         <i class="fa-solid fa-file-lines"></i> View Daily Summary
                                     </button>
+                                </div>
+                            <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                <div style="margin-top: 4px; text-align: center; padding: 6px; background: rgba(245, 158, 11, 0.1); border-radius: 8px; color: #d97706; font-size: 0.8rem; font-weight: 600;">
+                                    <i class="fa-solid fa-pen-to-square"></i> Awaiting Daily Summary
                                 </div>
                             <?php else: ?>
                                 <div class="mobile-card-row" style="border-bottom: none;">
