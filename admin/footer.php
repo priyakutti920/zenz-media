@@ -5,17 +5,6 @@
  <p class="footer-text">
  &copy; <?php echo date('Y'); ?> <?php echo htmlspecialchars($adminBrandName ?? 'Cloud Aspire'); ?> Admin Panel. All rights reserved.
  </p>
- <div class="footer-links">
- <span class="footer-divider">|</span>
- <a href="dashboard">Dashboard</a>
- <a href="employee">Employees</a>
- <a href="attendance">Attendance</a>
- <a href="task">Tasks</a>
- <a href="project">Projects</a>
- <a href="reports">Reports</a>
- <a href="site_settings">Site Settings</a>
- <a href="settings">Settings</a>
- </div>
  </div>
  </footer>
 
@@ -24,7 +13,7 @@
  .admin-footer {
  background: var(--surface);
  border-top: 1px solid var(--border);
- padding: 24px 32px;
+ padding: 20px 32px;
  margin-top: auto;
  width: 100%;
  box-sizing: border-box;
@@ -36,10 +25,9 @@
  width: 100%;
  margin: 0 auto;
  display: flex;
- justify-content: space-between;
+ justify-content: center;
  align-items: center;
- flex-wrap: wrap;
- gap: 16px;
+ text-align: center;
  box-sizing: border-box;
  }
 
@@ -49,46 +37,15 @@
  color: var(--text-tertiary);
  }
 
- .footer-links {
- display: flex;
- align-items: center;
- gap: 12px;
- }
-
- .footer-links a {
- font-size: 14px;
- color: var(--text-secondary);
- text-decoration: none;
- transition: color var(--transition);
- }
-
- .footer-links a:hover {
- color: var(--primary-500);
- }
-
- .footer-divider {
- color: var(--text-tertiary);
- }
-
  @media (max-width: 960px) {
  .admin-footer {
- padding: 20px 16px;
- }
-
- .footer-content {
- flex-direction: column;
- text-align: center;
- }
-
- .footer-links {
- flex-wrap: wrap;
- justify-content: center;
+ padding: 16px 16px;
  }
  }
 
  @media (max-width: 480px) {
  .admin-footer {
- padding: 16px 12px;
+ padding: 14px 12px;
  }
  }
  </style>

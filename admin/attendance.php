@@ -50,7 +50,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['mark_attendance'])) {
   $messageType = 'error';
   } else {
   try {
-  $activeShift = AttendanceHelper::getActiveShift($pdo);
+  $activeShift = AttendanceHelper::getEmployeeShift($pdo, $empId, $date);
   
   $delayMins = 0;
   $earlyExitMins = 0;
@@ -115,6 +115,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
   error_log('Delete attendance error: ' . $e->getMessage());
   $message = 'Error deleting attendance. Please try again.';
   $messageType = 'error';
+  }
+ }
+}
+
+// Handle Resolve Flagged Attendance (POST with CSRF)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'resolve_flagged_attendance' && isset($_POST['attendance_id'])) {
+ // Validate CSRF token
+ if (!Security::validateCSRFToken($_POST['csrf_token'] ?? '', 'attendance')) {
+  $message = 'Invalid security token. Please try again.';
+  $messageType = 'error';
+ } elseif (!$canManage) {
+  $message = 'Access Denied: You do not possess authorization to resolve flagged attendance records.';
+  $messageType = 'error';
+ } else {
+  $attendanceId = (int)$_POST['attendance_id'];
+  $approvedCheckOut = !empty($_POST['approved_check_out']) ? $_POST['approved_check_out'] : null;
+  $resolutionStatus = $_POST['resolution_status'] ?? 'present';
+  $resolutionNotes = trim($_POST['resolution_notes'] ?? '');
+
+  $res = AttendanceHelper::adminResolveFlaggedAttendance($pdo, $attendanceId, $adminId, [
+   'approved_check_out' => $approvedCheckOut,
+   'status' => $resolutionStatus,
+   'notes' => $resolutionNotes
+  ]);
+
+  if ($res['success']) {
+   $message = $res['message'];
+   $messageType = 'success';
+  } else {
+   $message = $res['message'];
+   $messageType = 'error';
   }
  }
 }
@@ -273,6 +304,7 @@ try {
 }
 
 $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $totalHalfDay) / $totalRecorded) * 100, 1) : 0;
+$flaggedCount = AttendanceHelper::getFlaggedAttendanceCount($pdo);
 ?>
 
 <?php include 'header.php'; ?>
@@ -283,7 +315,15 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
   <h1 class="page-title">Attendance Report</h1>
   <p class="page-subtitle">Track and manage employee attendance records</p>
  </div>
- <div style="display: flex; gap: 12px;">
+ <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+  <a href="working_days" class="btn btn-secondary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 8px;">
+      <i class="fa-solid fa-calendar-days"></i>
+      <span>Working Days</span>
+  </a>
+  <a href="attendance_requests" class="btn btn-secondary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 8px;">
+      <i class="fa-solid fa-clipboard-check"></i>
+      <span>WFH Approvals</span>
+  </a>
   <button class="btn btn-primary" onclick="openMarkAttendanceModal()">
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
   <polyline points="9 11 12 14 22 4"></polyline>
@@ -313,84 +353,103 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
 </div>
 <?php endif; ?>
 
+<!-- Flagged Records Notification Banner -->
+<?php if ($flaggedCount > 0): ?>
+<div style="background: linear-gradient(135deg, rgba(239, 68, 68, 0.08), rgba(220, 38, 38, 0.04)); border: 1.5px solid rgba(239, 68, 68, 0.25); border-radius: var(--radius-xl); padding: 16px 20px; margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px;">
+	<div style="display: flex; align-items: center; gap: 14px;">
+		<div style="width: 42px; height: 42px; border-radius: 10px; background: rgba(239, 68, 68, 0.15); color: #dc2626; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0;">
+			<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>
+		</div>
+		<div>
+			<div style="font-weight: 700; color: #b91c1c; font-size: 15px;">
+				Action Required: <?php echo $flaggedCount; ?> Attendance Record<?php echo $flaggedCount > 1 ? 's' : ''; ?> Flagged for HR Review
+			</div>
+			<div style="font-size: 13px; color: var(--text-secondary); margin-top: 2px;">
+				Employees reached shift cutoff without checking out. Actual check-in data has been preserved; HR review and checkout authorization is required.
+			</div>
+		</div>
+	</div>
+</div>
+<?php endif; ?>
+
 <!-- Summary Stats Cards -->
 <div class="att-stats-grid">
  <div class="att-stat-card att-stat--total">
-  <div class="att-stat-icon">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-  <circle cx="9" cy="7" r="4"></circle>
-  <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-  <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-  </svg>
-  </div>
   <div class="att-stat-info">
-  <span class="att-stat-label">Total Recorded</span>
-  <span class="att-stat-value"><?php echo $totalRecorded; ?></span>
+   <span class="att-stat-label">Total Recorded</span>
+   <span class="att-stat-value"><?php echo $totalRecorded; ?></span>
+   <span class="att-stat-sub">
+    <i class="fa-solid fa-clipboard-user"></i>
+    <span>Recorded sessions</span>
+   </span>
+  </div>
+  <div class="att-stat-icon">
+   <i class="fa-solid fa-users"></i>
   </div>
  </div>
  <div class="att-stat-card att-stat--present">
-  <div class="att-stat-icon">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
-  <polyline points="22 4 12 14.01 9 11.01"></polyline>
-  </svg>
-  </div>
   <div class="att-stat-info">
-  <span class="att-stat-label">Present</span>
-  <span class="att-stat-value"><?php echo $totalPresent; ?></span>
+   <span class="att-stat-label">Present</span>
+   <span class="att-stat-value"><?php echo $totalPresent; ?></span>
+   <span class="att-stat-sub">
+    <i class="fa-solid fa-circle-check" style="color: #10b981;"></i>
+    <span>On-time attendance</span>
+   </span>
+  </div>
+  <div class="att-stat-icon">
+   <i class="fa-solid fa-user-check"></i>
   </div>
  </div>
  <div class="att-stat-card att-stat--absent">
-  <div class="att-stat-icon">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <circle cx="12" cy="12" r="10"></circle>
-  <line x1="15" y1="9" x2="9" y2="15"></line>
-  <line x1="9" y1="9" x2="15" y2="15"></line>
-  </svg>
-  </div>
   <div class="att-stat-info">
-  <span class="att-stat-label">Absent</span>
-  <span class="att-stat-value"><?php echo $totalAbsent; ?></span>
+   <span class="att-stat-label">Absent</span>
+   <span class="att-stat-value"><?php echo $totalAbsent; ?></span>
+   <span class="att-stat-sub">
+    <i class="fa-solid fa-circle-xmark" style="color: #ef4444;"></i>
+    <span>Missing / unexcused</span>
+   </span>
+  </div>
+  <div class="att-stat-icon">
+   <i class="fa-solid fa-user-xmark"></i>
   </div>
  </div>
  <div class="att-stat-card att-stat--late">
-  <div class="att-stat-icon">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <circle cx="12" cy="12" r="10"></circle>
-  <polyline points="12 6 12 12 16 14"></polyline>
-  </svg>
-  </div>
   <div class="att-stat-info">
-  <span class="att-stat-label">Late</span>
-  <span class="att-stat-value"><?php echo $totalLate; ?></span>
+   <span class="att-stat-label">Late</span>
+   <span class="att-stat-value"><?php echo $totalLate; ?></span>
+   <span class="att-stat-sub">
+    <i class="fa-solid fa-clock" style="color: #f59e0b;"></i>
+    <span>Grace threshold exceeded</span>
+   </span>
+  </div>
+  <div class="att-stat-icon">
+   <i class="fa-solid fa-business-time"></i>
   </div>
  </div>
  <div class="att-stat-card att-stat--leave">
-  <div class="att-stat-icon">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
-  <line x1="16" y1="2" x2="16" y2="6"></line>
-  <line x1="8" y1="2" x2="8" y2="6"></line>
-  <line x1="3" y1="10" x2="21" y2="10"></line>
-  </svg>
-  </div>
   <div class="att-stat-info">
-  <span class="att-stat-label">On Leave</span>
-  <span class="att-stat-value"><?php echo $totalOnLeave; ?></span>
+   <span class="att-stat-label">On Leave</span>
+   <span class="att-stat-value"><?php echo $totalOnLeave; ?></span>
+   <span class="att-stat-sub">
+    <i class="fa-solid fa-calendar-minus" style="color: #6366f1;"></i>
+    <span>Scheduled absence</span>
+   </span>
+  </div>
+  <div class="att-stat-icon">
+   <i class="fa-solid fa-calendar-day"></i>
   </div>
  </div>
  <div class="att-stat-card att-stat--rate">
-  <div class="att-stat-icon">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <line x1="18" y1="20" x2="18" y2="10"></line>
-  <line x1="12" y1="20" x2="12" y2="4"></line>
-  <line x1="6" y1="20" x2="6" y2="14"></line>
-  </svg>
-  </div>
   <div class="att-stat-info">
-  <span class="att-stat-label">Attendance Rate</span>
-  <span class="att-stat-value"><?php echo $attendanceRate; ?>%</span>
+   <span class="att-stat-label">Attendance Rate</span>
+   <span class="att-stat-value"><?php echo $attendanceRate; ?>%</span>
+   <span class="att-stat-sub">
+    <i class="fa-solid fa-chart-line" style="color: #2563eb;"></i>
+    <span>Turnout percentage</span>
+   </span>
+  </div>
+  <div class="att-stat-icon">
+   <i class="fa-solid fa-chart-pie"></i>
   </div>
  </div>
 </div>
@@ -627,6 +686,14 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
   <span class="att-status-badge att-status--<?php echo htmlspecialchars($rec['status']); ?>">
   <?php echo htmlspecialchars(ucfirst(str_replace('_', ' ', $rec['status']))); ?>
   </span>
+  <?php if (!empty($rec['is_flagged_for_review'])): ?>
+      <div style="margin-top: 4px;">
+          <span class="att-status-badge" style="background: rgba(239, 68, 68, 0.15); color: #dc2626; border: 1px solid rgba(239, 68, 68, 0.3); font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; gap: 4px;" title="<?php echo htmlspecialchars($rec['flag_reason'] ?? 'Shift cutoff reached without check-out'); ?>">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"></path><line x1="4" y1="22" x2="4" y2="15"></line></svg>
+              HR Review (Cutoff Unclosed)
+          </span>
+      </div>
+  <?php endif; ?>
   <?php if (!empty($rec['leave_code'])): ?>
       <div style="font-size:11px; margin-top:4px; color:var(--text-secondary);">Reason: <?php echo htmlspecialchars($rec['leave_code']); ?></div>
   <?php endif; ?>
@@ -658,6 +725,13 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
   </span>
   </td>
   <td>
+  <?php if (!empty($rec['is_flagged_for_review']) && $canManage): ?>
+  <button type="button" class="btn-action btn-sm" style="background: #fee2e2; color: #b91c1c; border: 1px solid #f87171; font-weight: 600; margin-right: 4px;"
+      onclick="openResolveFlagModal(<?php echo (int)$rec['id']; ?>, '<?php echo htmlspecialchars(addslashes($rec['first_name'] . ' ' . $rec['last_name'])); ?>', '<?php echo htmlspecialchars($rec['date']); ?>', '<?php echo htmlspecialchars($rec['check_in'] ? date('h:i A', strtotime($rec['check_in'])) : 'None'); ?>', '<?php echo htmlspecialchars(addslashes($rec['flag_reason'] ?? 'Cutoff unclosed')); ?>')" title="Resolve HR Review">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+      <span>HR Resolve</span>
+  </button>
+  <?php endif; ?>
   <button type="button" class="btn-action btn-secondary btn-sm"
   onclick="editAttendance('<?php echo htmlspecialchars($rec['employee_id']); ?>', '<?php echo htmlspecialchars($rec['date']); ?>', '<?php echo htmlspecialchars($rec['check_in'] ? date('H:i', strtotime($rec['check_in'])) : ''); ?>', '<?php echo htmlspecialchars($rec['check_out'] ? date('H:i', strtotime($rec['check_out'])) : ''); ?>', '<?php echo htmlspecialchars($rec['status']); ?>', '<?php echo htmlspecialchars(addslashes($rec['notes'] ?? '')); ?>')" style="margin-right: 4px;" title="Edit">
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -895,6 +969,69 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
  </div>
 </div>
 
+<!-- Resolve Flagged Attendance Modal -->
+<div class="modal" id="resolveFlagModal">
+ <div class="modal-backdrop" onclick="closeModal('resolveFlagModal')"></div>
+ <div class="modal-content" style="max-width: 520px;">
+  <div class="modal-header">
+   <h2 class="modal-title">Resolve Cutoff Attendance Review</h2>
+   <button class="modal-close" onclick="closeModal('resolveFlagModal')">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+     <line x1="18" y1="6" x2="6" y2="18"></line>
+     <line x1="6" y1="6" x2="18" y2="18"></line>
+    </svg>
+   </button>
+  </div>
+  <form method="POST" action="" class="modal-form">
+   <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf_token); ?>">
+   <input type="hidden" name="action" value="resolve_flagged_attendance">
+   <input type="hidden" name="attendance_id" id="res_attendance_id" value="">
+
+   <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: var(--radius-lg); padding: 14px 16px; margin-bottom: 20px; font-size: 13px; color: #991b1b; line-height: 1.5;">
+    <div style="font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
+     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+     Unclosed Workday Flagged by System
+    </div>
+    <div><strong>Employee:</strong> <span id="res_emp_name">—</span></div>
+    <div><strong>Workday Date:</strong> <span id="res_date">—</span></div>
+    <div><strong>Preserved Check-In:</strong> <span id="res_check_in">—</span></div>
+    <div style="margin-top: 4px; font-size: 12px; color: #b91c1c;"><strong>Flag Reason:</strong> <span id="res_reason">—</span></div>
+   </div>
+
+   <div class="form-group">
+    <label for="res_approved_check_out">Approved Check-Out Time *</label>
+    <input type="time" id="res_approved_check_out" name="approved_check_out" class="input" required value="18:00">
+    <small style="color: var(--text-tertiary); font-size: 12px; margin-top: 4px; display: block;">Authorize employee departure time. Working hours and status will be recalculated automatically.</small>
+   </div>
+
+   <div class="form-group">
+    <label for="res_resolution_status">Final Attendance Status *</label>
+    <select id="res_resolution_status" name="resolution_status" class="input" required>
+     <option value="present">Present</option>
+     <option value="late">Late</option>
+     <option value="half_day">Half Day</option>
+     <option value="absent">Absent</option>
+    </select>
+   </div>
+
+   <div class="form-group">
+    <label for="res_resolution_notes">HR Resolution Notes / Justification *</label>
+    <textarea id="res_resolution_notes" name="resolution_notes" class="input" rows="3" placeholder="Enter reason for checkout time authorization..." required></textarea>
+   </div>
+
+   <div class="modal-actions">
+    <button type="button" class="btn btn-secondary" onclick="closeModal('resolveFlagModal')">Cancel</button>
+    <button type="submit" class="btn btn-primary" style="background: linear-gradient(135deg, #059669, #10b981);">
+     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="20 6 9 17 4 12"></polyline>
+     </svg>
+     Authorize &amp; Resolve
+    </button>
+   </div>
+  </form>
+ </div>
+</div>
+
 <style>
 /* ==========================================
   Attendance Report Styles
@@ -903,22 +1040,42 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
 /* Stats Grid */
 .att-stats-grid {
  display: grid;
- grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+ grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
  gap: 16px;
- margin-bottom: 32px;
+ margin-bottom: 28px;
+ width: 100%;
+ box-sizing: border-box;
 }
 
 .att-stat-card {
- background: var(--surface);
- border: 1px solid var(--border);
- border-radius: var(--radius-xl);
- padding: 20px 24px;
+ background: var(--adm-surface, var(--surface));
+ border: 1px solid var(--adm-border, var(--border));
+ border-radius: var(--adm-radius-lg, var(--radius-xl, 14px));
+ padding: 20px;
+ box-shadow: var(--adm-shadow-card, 0 1px 3px rgba(15, 23, 42, 0.04), 0 6px 18px -2px rgba(15, 23, 42, 0.05));
  display: flex;
- align-items: center;
+ align-items: flex-start;
+ justify-content: space-between;
  gap: 16px;
- transition: all var(--transition);
  position: relative;
  overflow: hidden;
+ transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+             box-shadow 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+             border-color 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+ cursor: default;
+ box-sizing: border-box;
+}
+
+.att-stat-card:hover {
+ transform: translateY(-3px);
+ box-shadow: var(--adm-shadow-hover, 0 14px 30px -4px rgba(15, 23, 42, 0.12));
+ border-color: var(--adm-brand-border, rgba(79, 70, 229, 0.25));
+}
+
+.att-stat-card:active {
+ transform: scale(0.985);
+ box-shadow: var(--adm-shadow-sm, 0 1px 3px rgba(0, 0, 0, 0.05));
+ transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
 .att-stat-card::before {
@@ -926,67 +1083,93 @@ $attendanceRate = $totalRecorded > 0 ? round((($totalPresent + $totalLate + $tot
  position: absolute;
  top: 0;
  left: 0;
- right: 0;
+ width: 100%;
  height: 3px;
- border-radius: var(--radius-xl) var(--radius-xl) 0 0;
- transition: all var(--transition);
+ background: transparent;
+ transition: background 0.22s ease;
 }
 
-.att-stat--total::before { background: linear-gradient(90deg, var(--primary-500), var(--accent-500)); }
-.att-stat--present::before { background: var(--success-500); }
-.att-stat--absent::before { background: var(--danger-500); }
-.att-stat--late::before { background: var(--warning-500); }
-.att-stat--leave::before { background: var(--accent-500); }
-.att-stat--rate::before { background: linear-gradient(90deg, var(--success-500), var(--primary-500)); }
-
-.att-stat-card:hover {
- transform: translateY(-3px);
- box-shadow: var(--shadow-lg);
- border-color: var(--border-hover);
-}
-
-.att-stat-icon {
- width: 44px;
- height: 44px;
- border-radius: var(--radius-lg);
- display: flex;
- align-items: center;
- justify-content: center;
- flex-shrink: 0;
- transition: all var(--transition-smooth);
-}
-
-.att-stat-icon svg {
- width: 22px;
- height: 22px;
-}
-
-.att-stat--total .att-stat-icon { background: var(--primary-50); color: var(--primary-500); }
-.att-stat--present .att-stat-icon { background: var(--success-50); color: var(--success-500); }
-.att-stat--absent .att-stat-icon { background: var(--danger-50); color: var(--danger-500); }
-.att-stat--late .att-stat-icon { background: var(--warning-50); color: var(--warning-500); }
-.att-stat--leave .att-stat-icon { background: var(--accent-50); color: var(--accent-500); }
-.att-stat--rate .att-stat-icon { background: var(--primary-50); color: var(--primary-500); }
+.att-stat--total::before { background: linear-gradient(90deg, #4f46e5, #7c3aed); }
+.att-stat--present::before { background: linear-gradient(90deg, #059669, #10b981); }
+.att-stat--absent::before { background: linear-gradient(90deg, #e11d48, #f43f5e); }
+.att-stat--late::before { background: linear-gradient(90deg, #d97706, #f59e0b); }
+.att-stat--leave::before { background: linear-gradient(90deg, #6366f1, #8b5cf6); }
+.att-stat--rate::before { background: linear-gradient(90deg, #2563eb, #06b6d4); }
 
 .att-stat-info {
  display: flex;
  flex-direction: column;
  gap: 4px;
+ min-width: 0;
+ flex: 1;
 }
 
 .att-stat-label {
- font-size: 12px;
- font-weight: 500;
- color: var(--text-secondary);
+ font-size: 0.8rem;
+ font-weight: 700;
  text-transform: uppercase;
- letter-spacing: 0.5px;
+ letter-spacing: 0.04em;
+ color: var(--adm-muted, var(--text-secondary));
 }
 
 .att-stat-value {
- font-size: 26px;
- font-weight: 700;
- color: var(--text-primary);
- line-height: 1;
+ font-family: 'Outfit', sans-serif;
+ font-size: 1.75rem;
+ font-weight: 800;
+ color: var(--adm-text-main, var(--text-primary));
+ line-height: 1.1;
+}
+
+.att-stat-sub {
+ font-size: 0.78rem;
+ color: var(--adm-faint, #94a3b8);
+ display: flex;
+ align-items: center;
+ gap: 5px;
+ margin-top: 2px;
+}
+
+.att-stat-icon {
+ width: 44px;
+ height: 44px;
+ border-radius: var(--adm-radius-md, 10px);
+ display: flex;
+ align-items: center;
+ justify-content: center;
+ font-size: 1.25rem;
+ flex-shrink: 0;
+ transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+             background-color 0.22s ease,
+             color 0.22s ease;
+}
+
+.att-stat-card:hover .att-stat-icon {
+ transform: scale(1.06);
+}
+
+.att-stat--total .att-stat-icon { background: var(--adm-brand-light, rgba(79, 70, 229, 0.08)); color: var(--adm-brand, #4f46e5); }
+.att-stat--present .att-stat-icon { background: var(--adm-success-light, #ecfdf5); color: var(--adm-success, #059669); }
+.att-stat--absent .att-stat-icon { background: var(--adm-danger-light, #fff1f2); color: var(--adm-danger, #e11d48); }
+.att-stat--late .att-stat-icon { background: var(--adm-warning-light, #fffbeb); color: var(--adm-warning, #d97706); }
+.att-stat--leave .att-stat-icon { background: rgba(99, 102, 241, 0.12); color: #6366f1; }
+.att-stat--rate .att-stat-icon { background: rgba(37, 99, 235, 0.12); color: #2563eb; }
+
+/* Accessibility: Respect Reduced Motion */
+@media (prefers-reduced-motion: reduce) {
+ .att-stat-card,
+ .att-stat-icon,
+ .att-stat-card::before {
+  transition: none !important;
+  animation: none !important;
+  transform: none !important;
+ }
+ .att-stat-card:hover,
+ .att-stat-card:active {
+  transform: none !important;
+ }
+ .att-stat-card:hover .att-stat-icon {
+  transform: none !important;
+ }
 }
 
 /* View Toggle */
@@ -1529,6 +1712,10 @@ tbody tr:hover td {
 @media (max-width: 768px) {
  .att-stats-grid {
   grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+ }
+ .att-stat-card {
+  padding: 16px;
  }
 
  .att-filters-form {
@@ -1565,6 +1752,10 @@ tbody tr:hover td {
 @media (max-width: 480px) {
  .att-stats-grid {
   grid-template-columns: 1fr;
+  gap: 10px;
+ }
+ .att-stat-card {
+  padding: 14px 16px;
  }
 }
 </style>
@@ -1586,6 +1777,7 @@ document.addEventListener('keydown', function(e) {
  if (e.key === 'Escape') {
   closeModal('markAttendanceModal');
   closeModal('adminWorkSummaryModal');
+  closeModal('resolveFlagModal');
  }
 });
 
@@ -1683,6 +1875,16 @@ function viewAdminWorkSummary(data) {
  document.getElementById('awsExtraInfo').innerHTML = extra.join(' &bull; ');
  
  openModal('adminWorkSummaryModal');
+}
+
+function openResolveFlagModal(id, empName, date, inTime, reason) {
+ document.getElementById('res_attendance_id').value = id;
+ document.getElementById('res_emp_name').textContent = empName;
+ document.getElementById('res_date').textContent = date;
+ document.getElementById('res_check_in').textContent = inTime;
+ document.getElementById('res_reason').textContent = reason;
+ document.getElementById('res_resolution_notes').value = '';
+ openModal('resolveFlagModal');
 }
 </script>
 

@@ -961,6 +961,10 @@ include 'header.php';
                 <i class="fa-solid fa-sliders"></i>
                 <span>Branding &amp; SMTP</span>
             </a>
+            <a href="office_location" class="btn-saas btn-saas-secondary" title="Navigate to Office GPS Location &amp; Attendance Geofencing">
+                <i class="fa-solid fa-location-dot"></i>
+                <span>Office GPS</span>
+            </a>
         </div>
     </div>
 

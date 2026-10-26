@@ -288,24 +288,83 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['action'])) {
                 $_SESSION['shift_flash'] = "Active shift cannot be deleted! Please set another shift as active first to prevent attendance calculation disruption.";
                 $_SESSION['shift_flash_type'] = 'error';
             } else {
-                // Safeguard: Check total shift count
-                $totalShifts = (int)$pdo->query("SELECT COUNT(*) FROM shift_settings")->fetchColumn();
-                if ($totalShifts <= 1) {
-                    $_SESSION['shift_flash'] = "Cannot delete the only configured shift in the system.";
+                // Safeguard 1: Check if employees are currently assigned to this shift
+                $stmtAssigned = $pdo->prepare("SELECT COUNT(*) FROM employees WHERE shift_id = ?");
+                $stmtAssigned->execute([$shiftId]);
+                $assignedCount = (int)$stmtAssigned->fetchColumn();
+
+                if ($assignedCount > 0) {
+                    $_SESSION['shift_flash'] = "Cannot delete '{$shift['shift_name']}' because {$assignedCount} employee(s) are currently assigned to it. Please reassign them to another shift first.";
                     $_SESSION['shift_flash_type'] = 'error';
                 } else {
-                    $delStmt = $pdo->prepare("DELETE FROM shift_settings WHERE id = ?");
-                    $delStmt->execute([$shiftId]);
+                    // Safeguard 2: Check total shift count
+                    $totalShifts = (int)$pdo->query("SELECT COUNT(*) FROM shift_settings")->fetchColumn();
+                    if ($totalShifts <= 1) {
+                        $_SESSION['shift_flash'] = "Cannot delete the only configured shift in the system.";
+                        $_SESSION['shift_flash_type'] = 'error';
+                    } else {
+                        $delStmt = $pdo->prepare("DELETE FROM shift_settings WHERE id = ?");
+                        $delStmt->execute([$shiftId]);
 
-                    Security::logAudit($adminId, 'delete_shift', 'shift_settings', $shiftId, ['shift_name' => $shift['shift_name']]);
+                        Security::logAudit($adminId, 'delete_shift', 'shift_settings', $shiftId, ['shift_name' => $shift['shift_name']]);
 
-                    $_SESSION['shift_flash'] = "Shift '{$shift['shift_name']}' deleted successfully.";
-                    $_SESSION['shift_flash_type'] = 'success';
+                        $_SESSION['shift_flash'] = "Shift '{$shift['shift_name']}' deleted successfully.";
+                        $_SESSION['shift_flash_type'] = 'success';
+                    }
                 }
             }
         } catch (PDOException $e) {
             error_log("Shift delete error: " . $e->getMessage());
             $_SESSION['shift_flash'] = 'Cannot delete shift because it is linked to historical employee attendance records.';
+            $_SESSION['shift_flash_type'] = 'error';
+        }
+        header("Location: shifts");
+        exit();
+    }
+
+    // 5. Assign Employees to Shift
+    elseif ($action === 'assign_employees' && isset($_POST['shift_id'])) {
+        $shiftId = (int)$_POST['shift_id'];
+        $empIds = $_POST['employee_ids'] ?? [];
+        if (!is_array($empIds)) $empIds = [];
+
+        try {
+            $stmt = $pdo->prepare("SELECT shift_name FROM shift_settings WHERE id = ?");
+            $stmt->execute([$shiftId]);
+            $shiftName = $stmt->fetchColumn();
+
+            if (!$shiftName) {
+                $_SESSION['shift_flash'] = "Target shift policy not found.";
+                $_SESSION['shift_flash_type'] = 'error';
+            } else {
+                $pdo->beginTransaction();
+
+                if (!empty($empIds)) {
+                    $inMarks = implode(',', array_fill(0, count($empIds), '?'));
+                    $params = array_merge([$shiftId], array_map('intval', $empIds));
+                    $stmtUp = $pdo->prepare("UPDATE employees SET shift_id = ? WHERE id IN ($inMarks)");
+                    $stmtUp->execute($params);
+
+                    // Reset employees who were on this shift but now unselected
+                    $resetParams = array_merge([$shiftId], array_map('intval', $empIds));
+                    $stmtReset = $pdo->prepare("UPDATE employees SET shift_id = NULL WHERE shift_id = ? AND id NOT IN ($inMarks)");
+                    $stmtReset->execute($resetParams);
+                } else {
+                    $stmtReset = $pdo->prepare("UPDATE employees SET shift_id = NULL WHERE shift_id = ?");
+                    $stmtReset->execute([$shiftId]);
+                }
+
+                $pdo->commit();
+                $assignedCount = count($empIds);
+                Security::logAudit($adminId, 'assign_shift_employees', 'shift_settings', $shiftId, ['assigned_count' => $assignedCount]);
+
+                $_SESSION['shift_flash'] = "Updated shift roster: {$assignedCount} employee(s) assigned to '{$shiftName}'.";
+                $_SESSION['shift_flash_type'] = 'success';
+            }
+        } catch (PDOException $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            error_log("Assign shift employees error: " . $e->getMessage());
+            $_SESSION['shift_flash'] = 'Error updating employee shift assignments.';
             $_SESSION['shift_flash_type'] = 'error';
         }
         header("Location: shifts");
@@ -329,6 +388,28 @@ try {
 } catch (PDOException $e) {
     $shifts = [];
 }
+
+// Load assigned employee counts per shift
+$assignedCounts = [];
+try {
+    $stCount = $pdo->query("SELECT shift_id, COUNT(*) as total FROM employees WHERE shift_id IS NOT NULL AND status = 'active' GROUP BY shift_id");
+    while ($r = $stCount->fetch(PDO::FETCH_ASSOC)) {
+        $assignedCounts[$r['shift_id']] = (int)$r['total'];
+    }
+} catch (PDOException $e) {}
+
+// Load all employees for assignment modal
+$allEmployeesList = [];
+try {
+    $stmtAllEmp = $pdo->query("
+        SELECT e.id, e.first_name, e.last_name, e.employee_id, e.department, e.shift_id, s.shift_name 
+        FROM employees e 
+        LEFT JOIN shift_settings s ON e.shift_id = s.id 
+        WHERE e.status = 'active' 
+        ORDER BY e.first_name ASC, e.last_name ASC
+    ");
+    $allEmployeesList = $stmtAllEmp->fetchAll(PDO::FETCH_ASSOC);
+} catch (PDOException $e) {}
 
 // Calculate KPI Metrics
 $totalShiftsCount = count($shifts);
@@ -1298,14 +1379,19 @@ include 'header.php';
                             <?php endif; ?>
                         </div>
 
-                        <?php if ($isAct): ?>
-                            <span class="status-pill status-pill-active" title="Currently enforcing this shift for workforce punches">
-                                <span class="pulse-dot"></span>
-                                <span>Active</span>
+                        <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                            <span class="status-pill" style="background: rgba(99, 102, 241, 0.08); color: #4f46e5; border: 1px solid rgba(99, 102, 241, 0.2);" title="Total active staff assigned to this shift">
+                                <i class="fa-solid fa-users" style="font-size: 0.72rem;"></i> <?php echo $assignedCounts[$shift['id']] ?? 0; ?> Staff
                             </span>
-                        <?php else: ?>
-                            <span class="status-pill status-pill-standby">Standby</span>
-                        <?php endif; ?>
+                            <?php if ($isAct): ?>
+                                <span class="status-pill status-pill-active" title="Currently enforcing this shift for workforce punches">
+                                    <span class="pulse-dot"></span>
+                                    <span>Active</span>
+                                </span>
+                            <?php else: ?>
+                                <span class="status-pill status-pill-standby">Standby</span>
+                            <?php endif; ?>
+                        </div>
                     </div>
 
                     <!-- 24h Visual Timeline Preview -->
@@ -1362,6 +1448,11 @@ include 'header.php';
                     </div>
 
                     <div style="display: flex; gap: 6px; align-items: center;">
+                        <!-- Assign Staff Button -->
+                        <button type="button" class="card-action-btn" onclick="handleAssignStaff(<?php echo $shift['id']; ?>, '<?php echo htmlspecialchars(addslashes($shift['shift_name'])); ?>')" title="Assign staff members to this shift">
+                            <i class="fa-solid fa-user-plus"></i> Staff
+                        </button>
+
                         <!-- Edit Button (Safe JSON Data-Attribute) -->
                         <button type="button" class="card-action-btn" data-shift='<?php echo htmlspecialchars($shiftJson, ENT_QUOTES, 'UTF-8'); ?>' onclick="handleEditShift(this)" title="Edit this shift policy">
                             <i class="fa-solid fa-pen-to-square"></i> Edit
@@ -1407,6 +1498,7 @@ include 'header.php';
                 <th>Shift Details</th>
                 <th>Working Window</th>
                 <th>Shift Duration</th>
+                <th>Assigned Staff</th>
                 <th>Grace &amp; Tolerances</th>
                 <th>Status</th>
                 <th style="text-align: right;">Actions</th>
@@ -1415,7 +1507,7 @@ include 'header.php';
         <tbody>
             <?php if (empty($shifts)): ?>
                 <tr>
-                    <td colspan="6" style="text-align: center; padding: 40px; color: var(--saas-text-muted);">
+                    <td colspan="7" style="text-align: center; padding: 40px; color: var(--saas-text-muted);">
                         No shifts configured.
                     </td>
                 </tr>
@@ -1454,6 +1546,11 @@ include 'header.php';
                             </span>
                         </td>
                         <td>
+                            <span class="status-pill" style="background: rgba(99, 102, 241, 0.08); color: #4f46e5; border: 1px solid rgba(99, 102, 241, 0.2);">
+                                <i class="fa-solid fa-users"></i> <?php echo $assignedCounts[$shift['id']] ?? 0; ?>
+                            </span>
+                        </td>
+                        <td>
                             <div style="font-size: 0.82rem;">
                                 Grace: <strong><?php echo $shift['grace_minutes']; ?>m</strong> |
                                 Late: <strong><?php echo $shift['late_threshold']; ?>m</strong> |
@@ -1476,6 +1573,9 @@ include 'header.php';
                         </td>
                         <td style="text-align: right;">
                             <div style="display: inline-flex; gap: 6px; align-items: center;">
+                                <button type="button" class="card-action-btn" onclick="handleAssignStaff(<?php echo $shift['id']; ?>, '<?php echo htmlspecialchars(addslashes($shift['shift_name'])); ?>')" title="Assign Staff">
+                                    <i class="fa-solid fa-user-plus"></i>
+                                </button>
                                 <button type="button" class="card-action-btn" data-shift='<?php echo htmlspecialchars($shiftJson, ENT_QUOTES, 'UTF-8'); ?>' onclick="handleEditShift(this)">
                                     <i class="fa-solid fa-pen-to-square"></i>
                                 </button>
@@ -1713,6 +1813,56 @@ include 'header.php';
         <div class="saas-modal-footer">
             <button type="button" class="btn-saas btn-saas-secondary" onclick="closeModal('simulatorModal')">Close Simulator</button>
         </div>
+    </div>
+</div>
+
+<!-- ─── Assign Staff Modal ────────────────────────────────────────────────── -->
+<div class="saas-modal" id="assignStaffModal" role="dialog" aria-modal="true" aria-labelledby="assignModalTitle">
+    <div class="saas-modal-backdrop" onclick="closeModal('assignStaffModal')"></div>
+    <div class="saas-modal-dialog" style="max-width: 600px;">
+        <div class="saas-modal-header">
+            <h2 class="saas-modal-title" id="assignModalTitle">
+                <i class="fa-solid fa-users-gear" style="color: #4f46e5;"></i>
+                <span>Assign Staff &ndash; <span id="assignShiftNameLabel" style="color: #4f46e5;"></span></span>
+            </h2>
+            <button type="button" class="saas-modal-close" onclick="closeModal('assignStaffModal')" aria-label="Close dialog">
+                <i class="fa-solid fa-xmark"></i>
+            </button>
+        </div>
+
+        <form method="POST" action="" id="assignStaffForm" style="margin: 0;">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf_token); ?>">
+            <input type="hidden" name="action" value="assign_employees">
+            <input type="hidden" name="shift_id" id="assign_modal_shift_id" value="">
+
+            <div class="saas-modal-body" style="padding: 20px 24px;">
+                <p style="font-size: 0.86rem; color: var(--saas-text-muted); margin-bottom: 16px;">
+                    Select the employees assigned to this shift policy. Checked employees will have their attendance calculated according to this shift's check-in/out and grace rules.
+                </p>
+
+                <!-- Search Filter & Actions -->
+                <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 14px;">
+                    <div style="position: relative; flex: 1;">
+                        <i class="fa-solid fa-magnifying-glass" style="position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--saas-text-muted); font-size: 0.85rem;"></i>
+                        <input type="text" id="assignEmployeeSearch" class="input-text" placeholder="Search employee name or ID..." onkeyup="filterAssignEmployees()" style="padding-left: 36px; height: 38px; font-size: 0.86rem;">
+                    </div>
+                    <button type="button" class="btn-saas btn-saas-secondary" onclick="toggleSelectAllStaff(true)" style="padding: 7px 12px; font-size: 0.8rem;">Select All</button>
+                    <button type="button" class="btn-saas btn-saas-secondary" onclick="toggleSelectAllStaff(false)" style="padding: 7px 12px; font-size: 0.8rem;">Clear</button>
+                </div>
+
+                <!-- Employees List Container -->
+                <div id="assignEmployeeListContainer" style="max-height: 340px; overflow-y: auto; border: 1px solid var(--saas-border); border-radius: var(--adm-radius-lg); padding: 8px; background: var(--adm-surface-subtle); display: flex; flex-direction: column; gap: 6px;">
+                    <!-- Populated dynamically via JS -->
+                </div>
+            </div>
+
+            <div class="saas-modal-footer">
+                <button type="button" class="btn-saas btn-saas-secondary" onclick="closeModal('assignStaffModal')">Cancel</button>
+                <button type="submit" class="btn-saas btn-saas-primary">
+                    <i class="fa-solid fa-floppy-disk"></i> Save Assignments
+                </button>
+            </div>
+        </form>
     </div>
 </div>
 
@@ -1975,6 +2125,72 @@ function runSimulation() {
     statusBadge.style.color = badgeColor;
 
     document.getElementById('simExplanationText').innerText = explanation;
+}
+
+// ─── Staff Assignment Controller ───────────────────────────────────────────
+const allEmployeesData = <?php echo json_encode($allEmployeesList, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;
+
+function handleAssignStaff(shiftId, shiftName) {
+    document.getElementById('assign_modal_shift_id').value = shiftId;
+    document.getElementById('assignShiftNameLabel').textContent = shiftName;
+    document.getElementById('assignEmployeeSearch').value = '';
+    renderAssignEmployees(shiftId);
+    openModal('assignStaffModal');
+}
+
+function renderAssignEmployees(targetShiftId) {
+    const container = document.getElementById('assignEmployeeListContainer');
+    container.innerHTML = '';
+
+    if (!allEmployeesData || allEmployeesData.length === 0) {
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--saas-text-muted);">No active employees found in workforce directory.</div>';
+        return;
+    }
+
+    allEmployeesData.forEach(emp => {
+        const isAssigned = (parseInt(emp.shift_id) === parseInt(targetShiftId));
+        const currentShiftText = emp.shift_name ? emp.shift_name : 'No Policy (Default)';
+        const item = document.createElement('label');
+        item.className = 'assign-emp-row';
+        item.setAttribute('data-search', ((emp.first_name || '') + ' ' + (emp.last_name || '') + ' ' + (emp.employee_id || '') + ' ' + (emp.department || '')).toLowerCase());
+        item.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--saas-card-bg); border: 1px solid var(--saas-border); border-radius: var(--adm-radius-md); cursor: pointer; transition: all 0.15s; margin-bottom: 2px;';
+        
+        item.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <input type="checkbox" name="employee_ids[]" value="${emp.id}" ${isAssigned ? 'checked' : ''} style="width: 17px; height: 17px; cursor: pointer; accent-color: #4f46e5;">
+                <div>
+                    <div style="font-weight: 700; font-size: 0.88rem; color: var(--saas-text-main);">${emp.first_name} ${emp.last_name}</div>
+                    <div style="font-size: 0.75rem; color: var(--saas-text-muted); display: flex; gap: 8px;">
+                        <span><i class="fa-solid fa-id-badge"></i> ${emp.employee_id}</span>
+                        ${emp.department ? `<span>&bull; ${emp.department}</span>` : ''}
+                    </div>
+                </div>
+            </div>
+            <div style="font-size: 0.76rem; font-weight: 600; text-align: right;">
+                ${isAssigned ? '<span style="color: #059669; background: #ecfdf5; padding: 2px 8px; border-radius: 999px;"><i class="fa-solid fa-check"></i> Assigned</span>' : `<span style="color: var(--saas-text-muted);">Current: ${currentShiftText}</span>`}
+            </div>
+        `;
+        container.appendChild(item);
+    });
+}
+
+function filterAssignEmployees() {
+    const term = document.getElementById('assignEmployeeSearch').value.toLowerCase().trim();
+    const rows = document.querySelectorAll('#assignEmployeeListContainer .assign-emp-row');
+    rows.forEach(r => {
+        const searchData = r.getAttribute('data-search') || '';
+        r.style.display = searchData.includes(term) ? 'flex' : 'none';
+    });
+}
+
+function toggleSelectAllStaff(select) {
+    const rows = document.querySelectorAll('#assignEmployeeListContainer .assign-emp-row');
+    rows.forEach(r => {
+        if (r.style.display !== 'none') {
+            const cb = r.querySelector('input[type="checkbox"]');
+            if (cb) cb.checked = select;
+        }
+    });
 }
 </script>
 

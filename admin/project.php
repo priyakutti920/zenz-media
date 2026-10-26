@@ -154,7 +154,7 @@ include 'header.php';
 <div class="page-header">
     <div>
         <h1 class="page-title">Employee Projects</h1>
-        <p class="page-subtitle">Receive projects, view Drive links, approve work, and add status updates.</p>
+        <p class="page-subtitle">Review submitted projects, view Drive links, approve work, and manage status updates.</p>
     </div>
 </div>
 
@@ -169,25 +169,9 @@ include 'header.php';
     <div><span>Approved</span><strong><?php echo $stats['approved']; ?></strong></div>
 </div>
 
-<section class="receive-card">
-    <h2>Receive New Project</h2>
-    <form method="post" class="receive-form">
-        <input type="hidden" name="csrf_token" value="<?php echo $csrfToken; ?>">
-        <label>Employee<select name="employee_id" required><option value="">Select employee</option>
-            <?php foreach ($employees as $employee): ?>
-            <option value="<?php echo $employee['id']; ?>"><?php echo htmlspecialchars($employee['first_name'] . ' ' . $employee['last_name']); ?></option>
-            <?php endforeach; ?>
-        </select></label>
-        <label>Project title<input name="title" maxlength="255" required></label>
-        <label>Google Drive link<input type="url" name="drive_link" maxlength="2048" placeholder="https://drive.google.com/..." required></label>
-        <label class="wide">Description<textarea name="description" rows="3"></textarea></label>
-        <button class="project-btn primary" name="receive_project">Receive Project</button>
-    </form>
-</section>
-
 <div class="project-list">
 <?php if (!$projects): ?>
-    <div class="empty-projects"><h2>No projects received</h2><p>Add the first employee project above.</p></div>
+    <div class="empty-projects"><h2>No projects found</h2><p>Projects submitted by employees will appear here.</p></div>
 <?php endif; ?>
 <?php foreach ($projects as $project): ?>
     <article class="project-card">

@@ -547,6 +547,58 @@ class Mailer {
     }
 
     /**
+     * Send email to Employee when their leave request is approved
+     */
+    public function sendLeaveApprovalAlert($toEmail, $employeeName, $leaveType, $leaveCode, $startDate, $endDate, $days) {
+        if (empty($toEmail)) return false;
+
+        $mail = $this->getMailer();
+        if (!$mail) return false;
+
+        try {
+            $mail->addAddress($toEmail);
+            $mail->Subject = "Leave Request Approved &bull; {$leaveCode}";
+            $mail->Body    = "<h3>Your Leave Request Has Been Approved</h3>
+                              <p>Dear " . htmlspecialchars($employeeName) . ",</p>
+                              <p>Your request for <strong>" . htmlspecialchars($leaveType) . "</strong> has been approved by the administrator.</p>
+                              <div style='background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:16px;margin:16px 0;'>
+                                  <p style='margin:0 0 8px;'><strong>Official Leave Code:</strong> <span style='font-family:monospace;font-size:1.2em;color:#166534;font-weight:bold;'>" . htmlspecialchars($leaveCode) . "</span></p>
+                                  <p style='margin:0 0 8px;'><strong>Duration:</strong> " . (int)$days . " Day(s)</p>
+                                  <p style='margin:0;'><strong>Period:</strong> " . htmlspecialchars($startDate) . " to " . htmlspecialchars($endDate) . "</p>
+                              </div>
+                              <p>Your attendance roster has been updated accordingly.</p>";
+            return $mail->send();
+        } catch (Exception $e) {
+            error_log("Mailer Error (Leave Approval Alert): " . $mail->ErrorInfo);
+            return false;
+        }
+    }
+
+    /**
+     * Send email to Employee when their leave request is rejected
+     */
+    public function sendLeaveRejectionAlert($toEmail, $employeeName, $leaveType, $startDate, $endDate, $rejectionReason = '') {
+        if (empty($toEmail)) return false;
+
+        $mail = $this->getMailer();
+        if (!$mail) return false;
+
+        try {
+            $mail->addAddress($toEmail);
+            $mail->Subject = "Leave Request Update: Declined";
+            $mail->Body    = "<h3>Leave Request Update</h3>
+                              <p>Dear " . htmlspecialchars($employeeName) . ",</p>
+                              <p>Your request for <strong>" . htmlspecialchars($leaveType) . "</strong> from " . htmlspecialchars($startDate) . " to " . htmlspecialchars($endDate) . " could not be approved at this time.</p>
+                              " . (!empty($rejectionReason) ? "<p><strong>Reason provided:</strong> " . nl2br(htmlspecialchars($rejectionReason)) . "</p>" : "") . "
+                              <p>Please contact human resources or your administrator if you have any questions.</p>";
+            return $mail->send();
+        } catch (Exception $e) {
+            error_log("Mailer Error (Leave Rejection Alert): " . $mail->ErrorInfo);
+            return false;
+        }
+    }
+
+    /**
      * Send email to Admin when a project is submitted
      */
     public function sendProjectSubmissionAlert($employeeName, $projectTitle, $driveLink) {
@@ -594,8 +646,67 @@ class Mailer {
     }
 
     /**
-     * Test SMTP Connection and send diagnostic test email
+     * Send email to an employee asking them to complete their Daily Work Summary
+     *
+     * @param string $employeeEmail
+     * @param string $employeeName
+     * @param string $summaryUrl Secure expiring link with single-use token
+     * @param string $shiftDate Formatted date string (e.g. Sat, Oct 24, 2026)
+     * @param string $scheduledCheckoutTime Formatted time string (e.g. 04:20 PM)
+     * @param string $shiftName Shift name (e.g. Regular Shift)
+     * @return bool
      */
+    public function sendDailySummaryRequestEmail($employeeEmail, $employeeName, $summaryUrl, $shiftDate, $scheduledCheckoutTime, $shiftName = 'Regular Shift') {
+        $instance = isset($this) ? $this : new self();
+        $mail = $instance->getMailer();
+        if (!$mail) {
+            return ['success' => false, 'error' => 'SMTP mailer is not configured or failed to initialize.'];
+        }
+
+        $bodyHtml = "
+            <p>Hi <strong>" . htmlspecialchars($employeeName) . "</strong>,</p>
+            <p>Your scheduled shift (<strong>" . htmlspecialchars($shiftName) . "</strong>) has ended. Please complete your daily work summary using the secure link below.</p>
+            
+            <div style=\"background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin: 18px 0;\">
+                <div style=\"font-size: 13px; font-weight: 600; color: #0f172a; margin-bottom: 6px;\">Summary Requirements:</div>
+                <ul style=\"margin: 0; padding-left: 20px; font-size: 13px; color: #475569; line-height: 1.6;\">
+                    <li><strong>Tasks worked on:</strong> Please describe your work.</li>
+                    <li><strong>Tasks completed:</strong> Please list completed tasks.</li>
+                    <li><strong>Pending tasks:</strong> Optional.</li>
+                </ul>
+            </div>
+
+            <p style=\"font-size: 13px; color: #334155;\">Once you submit your summary, your attendance for this shift (<strong>" . htmlspecialchars($shiftDate) . "</strong>) will be finalized automatically using the scheduled shift checkout time (<strong>" . htmlspecialchars($scheduledCheckoutTime) . "</strong>).</p>
+
+            <p style=\"font-size: 12px; color: #64748b; margin-top: 14px;\"><em>If you have already completed your summary, no further action is required.</em></p>
+        ";
+
+        try {
+            $mail->addAddress($employeeEmail, $employeeName);
+            $mail->Subject = 'Action Required: Complete Your Daily Work Summary';
+            $mail->Body = $instance->formatEmailTemplate(
+                'Complete Your Daily Work Summary',
+                'Action Required: Complete your daily work summary for ' . $shiftDate,
+                $bodyHtml,
+                'Complete Daily Work Summary',
+                $summaryUrl,
+                'Action Required',
+                '#d97706'
+            );
+            $sent = $mail->send();
+            return [
+                'success' => (bool)$sent,
+                'error'   => $sent ? null : ($mail->ErrorInfo ?: 'Unknown mail delivery error')
+            ];
+        } catch (Exception $e) {
+            error_log("Mailer Error (Daily Work Summary): " . $e->getMessage());
+            return [
+                'success' => false,
+                'error'   => $e->getMessage()
+            ];
+        }
+    }
+
     /**
      * Test SMTP Connection and send diagnostic test email with clean diagnostics
      */

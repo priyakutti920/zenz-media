@@ -2,6 +2,7 @@
 // Include database connection first
 require_once '../app/db.php';
 require_once '../app/security.php';
+require_once '../app/LeaveHelper.php';
 Security::init($pdo);
 Security::initSecureSession();
 
@@ -38,65 +39,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $leaveId = (int)($_POST['id'] ?? 0);
         
         if ($action === 'approve') {
-            try {
-                $stmt = $pdo->prepare("SELECT status, employee_id, leave_type, days, start_date FROM leave_requests WHERE id = ?");
-                $stmt->execute([$leaveId]);
-                $leave = $stmt->fetch();
-                
-                if ($leave && $leave['status'] === 'pending') {
-                    $leaveCode = 'LV-' . strtoupper(substr(str_shuffle('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'), 0, 6));
-                    $approvedAt = date('Y-m-d H:i:s');
-                    $adminId = $_SESSION['admin_id'] ?? 1;
-                    
-                    $updateStmt = $pdo->prepare("UPDATE leave_requests SET status = 'approved', leave_code = ?, approved_by = ?, approved_at = ? WHERE id = ?");
-                    $updateStmt->execute([$leaveCode, $adminId, $approvedAt, $leaveId]);
-                    
-                    $year = date('Y', strtotime($leave['start_date']));
-                    $balStmt = $pdo->prepare("UPDATE leave_balances SET used_days = used_days + ? WHERE employee_id = ? AND leave_type = ? AND year = ?");
-                    $balStmt->execute([$leave['days'], $leave['employee_id'], $leave['leave_type'], $year]);
-                    
-                    $message = "Leave approved successfully. Leave Code: $leaveCode generated.";
-                    $messageType = 'success';
-                    Security::logAudit('approve_leave', 'leave_request', $leaveId, ['code' => $leaveCode, 'employee_id' => $leave['employee_id']], $adminId);
-                }
-            } catch (PDOException $e) {
-                error_log("Error approving leave: " . $e->getMessage());
-                $message = "Error approving leave request. Please try again.";
-                $messageType = 'error';
-            }
+            $res = LeaveHelper::approveLeave($pdo, $leaveId, $adminId);
+            $message = $res['message'];
+            $messageType = $res['success'] ? 'success' : 'error';
         } elseif ($action === 'reject') {
-            try {
-                $approvedAt = date('Y-m-d H:i:s');
-                
-                $updateStmt = $pdo->prepare("UPDATE leave_requests SET status = 'rejected', approved_by = ?, approved_at = ? WHERE id = ?");
-                $updateStmt->execute([$adminId, $approvedAt, $leaveId]);
-                
-                $message = "Leave request rejected.";
-                $messageType = 'success';
-                Security::logAudit('reject_leave', 'leave_request', $leaveId, null, $adminId);
-            } catch (PDOException $e) {
-                error_log("Error rejecting leave: " . $e->getMessage());
-                $message = "Error rejecting leave request. Please try again.";
-                $messageType = 'error';
-            }
+            $rejectionReason = trim($_POST['rejection_reason'] ?? '');
+            $res = LeaveHelper::rejectLeave($pdo, $leaveId, $adminId, $rejectionReason);
+            $message = $res['message'];
+            $messageType = $res['success'] ? 'success' : 'error';
         } elseif ($action === 'delete') {
-            try {
-                $stmt = $pdo->prepare("DELETE FROM leave_requests WHERE id = ?");
-                $stmt->execute([$leaveId]);
-                
-                $message = "Leave request permanently deleted.";
-                $messageType = 'success';
-                Security::logAudit('delete_leave', 'leave_request', $leaveId, null, $adminId);
-            } catch (PDOException $e) {
-                error_log("Error deleting leave request: " . $e->getMessage());
-                $message = "Error deleting leave request. Please try again.";
-                $messageType = 'error';
-            }
+            $res = LeaveHelper::deleteLeave($pdo, $leaveId, $adminId);
+            $message = $res['message'];
+            $messageType = $res['success'] ? 'success' : 'error';
         } elseif ($action === 'delete_code') {
             try {
                 $stmt = $pdo->prepare("UPDATE leave_requests SET leave_code = NULL WHERE id = ?");
                 $stmt->execute([$leaveId]);
-                
                 $message = "Leave code deleted successfully.";
                 $messageType = 'success';
             } catch (PDOException $e) {
@@ -106,8 +64,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
         } elseif ($action === 'mark_used') {
             try {
-                $adminId = $_SESSION['admin_id'] ?? 1;
-                
                 $stmt = $pdo->prepare("SELECT leave_code FROM leave_requests WHERE id = ?");
                 $stmt->execute([$leaveId]);
                 $leaveCode = $stmt->fetchColumn();
@@ -127,40 +83,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $messageType = 'error';
             }
         } elseif ($action === 'generate_leave') {
-            try {
-                $employeeId = (int)$_POST['employee_id'];
-                $leaveType = $_POST['leave_type'];
-                $startDate = $_POST['start_date'];
-                $endDate = $_POST['end_date'];
-                $reason = trim($_POST['reason']);
-                
-                $start = new DateTime($startDate);
-                $end = new DateTime($endDate);
-                $days = $end->diff($start)->days + 1;
-                
-                $adminId = $_SESSION['admin_id'] ?? 1;
-                $approvedAt = date('Y-m-d H:i:s');
-                
-                $stmt = $pdo->prepare("INSERT INTO leave_requests (employee_id, leave_type, start_date, end_date, days, reason, status, approved_by, approved_at) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?)");
-                $stmt->execute([$employeeId, $leaveType, $startDate, $endDate, $days, $reason, $adminId, $approvedAt]);
-                $leaveId = $pdo->lastInsertId();
-                
-                $leaveCode = 'LV-' . strtoupper(substr(str_shuffle('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'), 0, 6));
-                
-                $updateStmt = $pdo->prepare("UPDATE leave_requests SET leave_code = ? WHERE id = ?");
-                $updateStmt->execute([$leaveCode, $leaveId]);
-                
-                $year = date('Y', strtotime($startDate));
-                $balStmt = $pdo->prepare("UPDATE leave_balances SET used_days = used_days + ? WHERE employee_id = ? AND leave_type = ? AND year = ?");
-                $balStmt->execute([$days, $employeeId, $leaveType, $year]);
-                
-                $message = "Leave generated successfully. Leave Code: $leaveCode.";
-                $messageType = 'success';
-            } catch (Exception $e) {
-                error_log("Error generating leave: " . $e->getMessage());
-                $message = "Error generating leave. Please try again.";
-                $messageType = 'error';
-            }
+            $employeeId = (int)($_POST['employee_id'] ?? 0);
+            $leaveType  = $_POST['leave_type'] ?? 'casual';
+            $startDate  = $_POST['start_date'] ?? '';
+            $endDate    = $_POST['end_date'] ?? '';
+            $reason     = trim($_POST['reason'] ?? '');
+
+            $res = LeaveHelper::generateLeave($pdo, $adminId, $employeeId, $leaveType, $startDate, $endDate, $reason);
+            $message = $res['message'];
+            $messageType = $res['success'] ? 'success' : 'error';
         }
     }
     
@@ -357,6 +288,12 @@ try {
             <p class="task-description" style="font-size: 13px;">
                 <strong>Reason:</strong> <?php echo nl2br(htmlspecialchars($leave['reason'])); ?>
             </p>
+
+            <?php if ($leave['status'] === 'rejected' && !empty($leave['rejection_reason'])): ?>
+                <div style="margin-top: 8px; padding: 8px 12px; background: rgba(239, 68, 68, 0.08); border-left: 3px solid #ef4444; border-radius: 4px; font-size: 12px; color: #b91c1c;">
+                    <strong>Declined Reason:</strong> <?php echo htmlspecialchars($leave['rejection_reason']); ?>
+                </div>
+            <?php endif; ?>
             
             <?php if ($leave['status'] === 'approved' && $leave['leave_code']): 
                 $isActive = (strtotime($leave['end_date']) >= strtotime(date('Y-m-d')));
@@ -419,7 +356,7 @@ try {
                         <polyline points="22 4 12 14.01 9 11.01"></polyline>
                     </svg>
                 </button>
-                <button type="button" onclick="if(confirm('Reject this leave request?')) submitLeaveAction('reject', <?php echo $leave['id']; ?>)" class="btn-action btn-delete" style="border:none; cursor:pointer;" title="Reject">
+                <button type="button" onclick="rejectLeavePrompt(<?php echo $leave['id']; ?>)" class="btn-action btn-delete" style="border:none; cursor:pointer;" title="Reject">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <line x1="18" y1="6" x2="6" y2="18"></line>
                         <line x1="6" y1="6" x2="18" y2="18"></line>
@@ -585,7 +522,14 @@ function closeModal(id) {
     }
 }
 
-function submitLeaveAction(action, id) {
+function rejectLeavePrompt(id) {
+    const reason = prompt('Please enter the reason for declining this leave application (optional):');
+    if (reason !== null) {
+        submitLeaveAction('reject', id, { rejection_reason: reason });
+    }
+}
+
+function submitLeaveAction(action, id, extraParams) {
     const form = document.createElement('form');
     form.method = 'POST';
     form.action = 'leave';
@@ -607,6 +551,16 @@ function submitLeaveAction(action, id) {
     idInput.name = 'id';
     idInput.value = id;
     form.appendChild(idInput);
+
+    if (extraParams && typeof extraParams === 'object') {
+        for (const k in extraParams) {
+            const p = document.createElement('input');
+            p.type = 'hidden';
+            p.name = k;
+            p.value = extraParams[k];
+            form.appendChild(p);
+        }
+    }
 
     document.body.appendChild(form);
     form.submit();

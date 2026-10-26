@@ -5,8 +5,9 @@ date_default_timezone_set('Asia/Kolkata');
 // Include database connection
 require_once 'app/db.php';
 
-// Initialize security utilities
+// Initialize security utilities and helpers
 require_once 'app/security.php';
+require_once 'app/AttendanceHelper.php';
 Security::init($pdo);
 Security::initSecureSession();
 
@@ -174,6 +175,14 @@ try {
     }
 } catch (PDOException $e) {
     error_log("Error fetching today's attendance: " . $e->getMessage());
+}
+
+// Evaluate automatic Attendance Portal closure status
+$portalClosure = null;
+try {
+    $portalClosure = AttendanceHelper::evaluatePortalClosureStatus($pdo, $employee_id);
+} catch (Exception $e) {
+    error_log("Portal closure check failed: " . $e->getMessage());
 }
 
 // Calculate Task Completion Rate
@@ -1390,34 +1399,61 @@ if ($currentHour < 12) {
                 </section>
 
                 <!-- Today's Attendance Quick Widget -->
-                <section class="attendance-banner">
+                <section class="attendance-banner" style="<?php echo ($portalClosure && $portalClosure['is_closed']) ? 'background: linear-gradient(135deg, rgba(239, 68, 68, 0.08), rgba(220, 38, 38, 0.03)); border-color: rgba(239, 68, 68, 0.3);' : ''; ?>">
                     <div class="attendance-info-left">
-                        <div class="attendance-icon-badge">
-                            <i class="fas fa-fingerprint icon-anim-pulse"></i>
+                        <div class="attendance-icon-badge" style="<?php echo ($portalClosure && $portalClosure['is_closed']) ? 'background: #dc2626; box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);' : ''; ?>">
+                            <?php if ($portalClosure && $portalClosure['is_closed']): ?>
+                                <i class="fas fa-lock"></i>
+                            <?php else: ?>
+                                <i class="fas fa-fingerprint icon-anim-pulse"></i>
+                            <?php endif; ?>
                         </div>
                         <div>
-                            <h3 class="attendance-title">Today's Attendance Status</h3>
-                            <div class="attendance-sub">
-                                <?php if ($todayAttendance && !empty($todayAttendance['check_in'])): ?>
-                                    <span style="color: var(--db-emerald); font-weight: 700;">
-                                        <i class="fas fa-circle-check"></i> Checked In at <?php echo date('h:i A', strtotime($todayAttendance['check_in'])); ?>
+                            <?php if ($portalClosure && $portalClosure['is_closed']): ?>
+                                <h3 class="attendance-title" style="color: #b91c1c;">Attendance Portal Closed</h3>
+                                <div class="attendance-sub">
+                                    <span style="color: #dc2626; font-weight: 600;">
+                                        <?php echo htmlspecialchars($portalClosure['message']); ?>
                                     </span>
-                                    <?php if (!empty($todayAttendance['check_out'])): ?>
-                                        &bull; Checked Out at <?php echo date('h:i A', strtotime($todayAttendance['check_out'])); ?>
-                                    <?php else: ?>
-                                        &bull; Shift active
+                                    <?php if (!empty($todayAttendance['check_in'])): ?>
+                                        <div style="font-size: 0.8rem; color: var(--db-muted); margin-top: 3px;">
+                                            Checked in: <?php echo date('h:i A', strtotime($todayAttendance['check_in'])); ?>
+                                            <?php if (!empty($todayAttendance['check_out'])): ?>
+                                                &bull; Checked out: <?php echo date('h:i A', strtotime($todayAttendance['check_out'])); ?>
+                                            <?php elseif (!empty($portalClosure['needs_hr_review'])): ?>
+                                                &bull; <strong style="color: #b91c1c;">Unclosed workday flagged for HR review</strong>
+                                            <?php endif; ?>
+                                        </div>
                                     <?php endif; ?>
-                                <?php else: ?>
-                                    <span style="color: var(--db-amber); font-weight: 600;">
-                                        <i class="fas fa-clock"></i> No check-in recorded for today yet.
-                                    </span>
-                                <?php endif; ?>
-                            </div>
+                                </div>
+                            <?php else: ?>
+                                <h3 class="attendance-title">Today's Attendance Status</h3>
+                                <div class="attendance-sub">
+                                    <?php if ($todayAttendance && !empty($todayAttendance['check_in'])): ?>
+                                        <span style="color: var(--db-emerald); font-weight: 700;">
+                                            <i class="fas fa-circle-check"></i> Checked In at <?php echo date('h:i A', strtotime($todayAttendance['check_in'])); ?>
+                                        </span>
+                                        <?php if (!empty($todayAttendance['check_out'])): ?>
+                                            &bull; Checked Out at <?php echo date('h:i A', strtotime($todayAttendance['check_out'])); ?>
+                                        <?php else: ?>
+                                            &bull; Cutoff at <?php echo !empty($portalClosure['scheduled_checkout_time']) ? date('h:i A', strtotime($portalClosure['scheduled_checkout_time'])) : 'End of shift'; ?> (<?php echo $portalClosure['time_remaining_text'] ?? 'Active'; ?> remaining)
+                                        <?php endif; ?>
+                                    <?php else: ?>
+                                        <span style="color: var(--db-amber); font-weight: 600;">
+                                            <i class="fas fa-clock"></i> No check-in recorded yet &bull; Portal closes at <?php echo !empty($portalClosure['scheduled_checkout_time']) ? date('h:i A', strtotime($portalClosure['scheduled_checkout_time'])) : 'scheduled end time'; ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </div>
+                            <?php endif; ?>
                         </div>
                     </div>
 
-                    <a href="employee_attendance" class="action-btn action-btn-primary">
-                        <i class="fas fa-location-arrow"></i> Open Attendance Desk
+                    <a href="employee_attendance" class="action-btn <?php echo ($portalClosure && $portalClosure['is_closed']) ? 'action-btn-outline' : 'action-btn-primary'; ?>">
+                        <?php if ($portalClosure && $portalClosure['is_closed']): ?>
+                            <i class="fas fa-eye"></i> View Attendance Summary
+                        <?php else: ?>
+                            <i class="fas fa-location-arrow"></i> Open Attendance Desk
+                        <?php endif; ?>
                     </a>
                 </section>
 

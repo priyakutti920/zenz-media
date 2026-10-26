@@ -51,12 +51,38 @@ $workMode = $employee['work_mode'] ?? 'on_site';
 $empFullName = trim(($employee['first_name'] ?? '') . ' ' . ($employee['last_name'] ?? ''));
 $empDisplayCode = !empty($employee['employee_id']) ? $employee['employee_id'] : sprintf('EMP-%03d', $employee_id);
 
-// Get Active Shift Settings
-$activeShift = AttendanceHelper::getActiveShift($pdo);
+// Ensure Portal Closure schema is synced
+AttendanceHelper::ensurePortalClosureSchema($pdo);
+
+// Get Assigned Shift Settings for this Employee (with any approved exceptions)
+$activeShift = AttendanceHelper::getEmployeeShift($pdo, $employee_id, $today);
 $shiftStartTime = $activeShift['checkin_start'] ?? ($activeShift['start_time'] ?? '09:00:00');
-$shiftEndTime = $activeShift['checkout_time'] ?? ($activeShift['end_time'] ?? '18:00:00');
+$shiftEndTime = $activeShift['checkout_time'] ?? ($activeShift['end_time'] ?? '17:00:00');
 $graceMinutes = (int)($activeShift['grace_minutes'] ?? 10);
+$shiftWindow = AttendanceHelper::getShiftWindowForWorkday($activeShift, $today);
 $isEarly = (strtotime($currentTime) < strtotime($shiftEndTime));
+
+// Evaluate Authoritative Server-Side Portal Closure Status
+$portalClosure = AttendanceHelper::evaluatePortalClosureStatus($pdo, $employee_id);
+
+// Real-Time Heartbeat / Status API Endpoint for Active Sessions
+if (isset($_GET['action']) && $_GET['action'] === 'check_portal_status') {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([
+        'is_closed'               => $portalClosure['is_closed'],
+        'closure_reason'          => $portalClosure['closure_reason'],
+        'scheduled_checkout_time' => $portalClosure['scheduled_checkout_time'],
+        'scheduled_checkout_ts'   => $portalClosure['scheduled_checkout_ts'],
+        'seconds_remaining'       => $portalClosure['seconds_remaining'],
+        'time_remaining_text'     => $portalClosure['time_remaining_text'],
+        'message'                 => $portalClosure['message'],
+        'details'                 => $portalClosure['details'],
+        'needs_hr_review'         => $portalClosure['needs_hr_review'],
+        'server_time'             => $portalClosure['server_time'],
+        'server_date'             => $portalClosure['server_date']
+    ]);
+    exit();
+}
 
 // Get Office Geofencing Settings
 $officeSettings = AttendanceHelper::getOfficeLocationSettings($pdo);
@@ -73,6 +99,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['action'])) {
     }
 
     $action = $_POST['action'];
+
+    // ────────────────────────────────────────────────────────────────────────
+    // BACKEND CLOSURE ENFORCEMENT
+    // Revalidates shift schedule and server time on every attendance request.
+    // Strictly blocks bypass via direct URLs, API calls, page refreshes, dev tools.
+    // ────────────────────────────────────────────────────────────────────────
+    if (in_array($action, ['check_in', 'check_out', 'submit_request'], true)) {
+        $currentClosure = AttendanceHelper::evaluatePortalClosureStatus($pdo, $employee_id);
+        if ($currentClosure['is_closed']) {
+            $_SESSION['att_flash'] = "Your scheduled work hours have ended. Attendance access is now closed for today.";
+            $_SESSION['att_flash_type'] = "error";
+            header("Location: employee_attendance");
+            exit();
+        }
+    }
 
     // ────────────────────────────────────────────────────────────────────────
     // 1. CHECK-IN ACTION
@@ -358,21 +399,55 @@ $stmtToday->execute([$employee_id, $today]);
 $todaysRecord = $stmtToday->fetch(PDO::FETCH_ASSOC);
 
 // Determine Today's Status State
-// States: 'not_checked_in', 'checked_in', 'checked_out'
+// States: 'not_checked_in', 'checked_in', 'checked_out', 'portal_closed'
 $todayState = 'not_checked_in';
-if ($isCheckedIn) {
+if ($portalClosure['is_closed']) {
+    $todayState = 'portal_closed';
+} elseif ($isCheckedIn) {
     $todayState = 'checked_in';
 } elseif ($todaysRecord && !empty($todaysRecord['check_out'])) {
     $todayState = 'checked_out';
 }
 
-// Fetch Attendance History (Recent 30 Days)
+// Fetch Attendance History (Recent 30 Days) with Shift Resolution & Daily Work Summaries
 $history = [];
 try {
-    $stmtHistory = $pdo->prepare("SELECT * FROM attendance WHERE employee_id = ? ORDER BY date DESC, id DESC LIMIT 30");
+    $sqlHistory = "SELECT 
+        a.*,
+        COALESCE(dws.work_summary, a.work_summary) AS final_work_summary,
+        COALESCE(dws.completed_tasks, a.completed_tasks) AS final_completed_tasks,
+        COALESCE(dws.pending_tasks, a.pending_tasks) AS final_pending_tasks,
+        ar.requested_work_mode AS approved_request_mode,
+        ar.approved_check_in_time,
+        ar.approved_check_out_time,
+        COALESCE(ss.shift_name, def_ss.shift_name, 'Regular Shift') AS resolved_shift_name,
+        COALESCE(ar.approved_check_in_time, ss.checkin_start, def_ss.checkin_start) AS resolved_checkin_start,
+        COALESCE(ar.approved_check_out_time, ss.checkout_time, def_ss.checkout_time) AS resolved_checkout_time,
+        e.work_mode AS employee_work_mode
+    FROM attendance a
+    LEFT JOIN employees e ON a.employee_id = e.id
+    LEFT JOIN shift_settings ss ON e.shift_id = ss.id
+    LEFT JOIN (SELECT * FROM shift_settings WHERE is_active = 1 ORDER BY id ASC LIMIT 1) def_ss ON 1=1
+    LEFT JOIN (
+        SELECT attendance_id, work_summary, completed_tasks, pending_tasks 
+        FROM daily_work_summaries 
+        WHERE id IN (SELECT MAX(id) FROM daily_work_summaries GROUP BY attendance_id)
+    ) dws ON a.id = dws.attendance_id
+    LEFT JOIN (
+        SELECT employee_id, attendance_date, requested_work_mode, approved_check_in_time, approved_check_out_time 
+        FROM attendance_requests 
+        WHERE status = 'approved'
+        AND id IN (SELECT MAX(id) FROM attendance_requests WHERE status = 'approved' GROUP BY employee_id, attendance_date)
+    ) ar ON a.employee_id = ar.employee_id AND a.date = ar.attendance_date
+    WHERE a.employee_id = ?
+    ORDER BY a.date DESC, a.id DESC
+    LIMIT 30";
+
+    $stmtHistory = $pdo->prepare($sqlHistory);
     $stmtHistory->execute([$employee_id]);
     $history = $stmtHistory->fetchAll(PDO::FETCH_ASSOC);
 } catch (PDOException $e) {
+    error_log("Error fetching attendance history: " . $e->getMessage());
     $history = [];
 }
 
@@ -596,6 +671,55 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             right: 0;
             height: 4px;
             background: linear-gradient(90deg, #4f46e5, #06b6d4, #10b981);
+        }
+        .portal-closed-card::before {
+            background: linear-gradient(90deg, #e11d48, #f59e0b) !important;
+        }
+
+        /* ── Portal Auto-Closure & Live Cutoff Timer ── */
+        .portal-closure-box {
+            background: var(--att-danger-light);
+            border: 1.5px solid var(--att-danger-border);
+            border-radius: var(--att-radius-md);
+            padding: 16px 20px;
+            margin-top: 18px;
+            display: flex;
+            align-items: flex-start;
+            gap: 14px;
+            animation: fadeInDown 0.25s ease;
+        }
+        .portal-warning-box {
+            background: var(--att-warning-light);
+            border: 1.5px solid var(--att-warning-border);
+            border-radius: var(--att-radius-md);
+            padding: 12px 18px;
+            margin-bottom: 24px;
+            display: none;
+            align-items: center;
+            gap: 12px;
+            font-size: 0.92rem;
+            color: var(--att-warning);
+            font-weight: 600;
+            animation: fadeInDown 0.25s ease;
+        }
+        .btn-punch-closed {
+            background: var(--att-surface-subtle) !important;
+            color: var(--att-text-muted) !important;
+            border: 1.5px solid var(--att-border) !important;
+            cursor: not-allowed !important;
+            opacity: 0.75;
+        }
+        .badge-flagged-review {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: var(--att-radius-pill);
+            font-size: 0.8rem;
+            font-weight: 700;
+            background: var(--att-warning-light);
+            color: var(--att-warning);
+            border: 1px solid var(--att-warning-border);
         }
 
         .terminal-grid {
@@ -833,7 +957,7 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             text-transform: capitalize;
             white-space: nowrap;
         }
-        .status-present, .status-completed {
+        .status-present, .status-completed, .status-on_time {
             background: var(--att-success-light);
             color: var(--att-success);
             border: 1px solid var(--att-success-border);
@@ -852,6 +976,137 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             background: var(--att-surface-subtle);
             color: var(--att-text-muted);
             border: 1px solid var(--att-border);
+        }
+        .status-in_progress {
+            background: rgba(59, 130, 246, 0.12);
+            color: #2563eb;
+            border: 1px solid rgba(59, 130, 246, 0.3);
+        }
+        .status-pending_hr_review, .status-flagged {
+            background: rgba(239, 68, 68, 0.12);
+            color: #dc2626;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+        .status-summary_pending {
+            background: rgba(245, 158, 11, 0.15);
+            color: #d97706;
+            border: 1px solid rgba(245, 158, 11, 0.4);
+        }
+        .badge-auto-sched {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 7px;
+            border-radius: var(--att-radius-pill);
+            font-size: 0.72rem;
+            font-weight: 700;
+            background: rgba(16, 185, 129, 0.12);
+            color: #059669;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            margin-top: 3px;
+            white-space: nowrap;
+        }
+
+        .badge-overnight {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 7px;
+            border-radius: var(--att-radius-pill);
+            font-size: 0.72rem;
+            font-weight: 700;
+            background: rgba(99, 102, 241, 0.12);
+            color: #4f46e5;
+            border: 1px solid rgba(99, 102, 241, 0.25);
+            margin-top: 3px;
+        }
+
+        .badge-loc {
+            font-size: 0.82rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            white-space: nowrap;
+        }
+        .badge-loc.loc-verified {
+            color: var(--att-success);
+        }
+        .badge-loc.loc-remote {
+            color: var(--att-brand);
+            background: var(--att-brand-light);
+            border: 1px solid var(--att-brand-border);
+            padding: 2px 8px;
+            border-radius: var(--att-radius-pill);
+        }
+        .badge-loc.loc-exception {
+            color: #7c3aed;
+            background: rgba(124, 58, 237, 0.1);
+            border: 1px solid rgba(124, 58, 237, 0.25);
+            padding: 2px 8px;
+            border-radius: var(--att-radius-pill);
+        }
+        .badge-loc.loc-missing {
+            color: var(--att-text-muted);
+            font-weight: 500;
+        }
+
+        .shift-schedule-text {
+            font-size: 0.88rem;
+            font-weight: 600;
+            color: var(--att-text);
+            white-space: nowrap;
+        }
+        .shift-schedule-sub {
+            font-size: 0.75rem;
+            color: var(--att-text-muted);
+            font-weight: 500;
+            display: block;
+            margin-top: 2px;
+        }
+        .badge-custom-shift {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            padding: 1px 6px;
+            border-radius: var(--att-radius-pill);
+            font-size: 0.68rem;
+            font-weight: 700;
+            background: rgba(124, 58, 237, 0.1);
+            color: #7c3aed;
+            border: 1px solid rgba(124, 58, 237, 0.2);
+            margin-top: 2px;
+        }
+
+        .text-missing-checkout {
+            color: var(--att-warning);
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .hours-in-progress {
+            color: #2563eb;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .hours-pending {
+            color: #dc2626;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .history-sub-note {
+            font-size: 0.75rem;
+            color: var(--att-text-muted);
+            font-weight: 500;
+            margin-top: 2px;
         }
 
         .btn-view-summary {
@@ -904,6 +1159,15 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             gap: 8px;
             padding-top: 8px;
             border-top: 1px solid var(--att-border-subtle);
+        }
+        .mobile-card-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 0.84rem;
+            padding-top: 8px;
+            border-top: 1px solid var(--att-border-subtle);
+            gap: 8px;
         }
 
         /* ── Accessible Modal Dialogs ── */
@@ -1272,14 +1536,31 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
             <?php endif; ?>
         <?php endif; ?>
 
+        <!-- Real-Time Live Cutoff Warning Banner -->
+        <div id="portalCutoffWarningBanner" class="portal-warning-box"></div>
+        <div id="portalClosureLiveAlert" class="portal-closure-box" style="display:none; margin-bottom:24px;">
+            <i class="fa-solid fa-lock" style="color:var(--att-danger); font-size:1.35rem; margin-top:2px;"></i>
+            <div>
+                <div style="font-weight:800; font-size:1rem; color:var(--att-danger); line-height:1.4;">
+                    Your scheduled work hours have ended. Attendance access is now closed for today.
+                </div>
+                <div style="font-size:0.88rem; color:var(--att-text-muted); margin-top:4px; line-height:1.45;">
+                    The scheduled check-out time has arrived. Attendance actions have been automatically closed for today.
+                </div>
+            </div>
+        </div>
+
         <!-- Primary Hero Attendance Terminal Card -->
-        <section class="hero-terminal-card" aria-label="Today's Attendance Status">
+        <section class="hero-terminal-card <?php echo $portalClosure['is_closed'] ? 'portal-closed-card' : ''; ?>" aria-label="Today's Attendance Status">
             <div class="terminal-grid">
                 
                 <!-- Left: Status Display -->
                 <div>
                     <div class="status-eyebrow">
-                        <?php if ($todayState === 'checked_in'): ?>
+                        <?php if ($portalClosure['is_closed']): ?>
+                            <span class="pulse-dot pulse-idle" style="background:var(--att-danger);"></span>
+                            <span style="color:var(--att-danger); font-weight:700;">Shift Concluded &bull; Portal Closed</span>
+                        <?php elseif ($todayState === 'checked_in'): ?>
                             <span class="pulse-dot pulse-active"></span>
                             <span style="color:var(--att-success);">Current Status &bull; Active Shift</span>
                         <?php elseif ($todayState === 'checked_out'): ?>
@@ -1292,7 +1573,17 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                     </div>
 
                     <div class="status-title">
-                        <?php if ($todayState === 'checked_in'): ?>
+                        <?php if ($portalClosure['is_closed']): ?>
+                            <?php if (!empty($portalClosure['summary_pending']) || ($todaysRecord && ($todaysRecord['attendance_status'] ?? '') === 'summary_pending')): ?>
+                                Shift Cutoff Reached &bull; Daily Summary Pending
+                            <?php elseif ($portalClosure['needs_hr_review']): ?>
+                                Shift Cutoff Reached &bull; Preserved for HR Review
+                            <?php elseif ($todaysRecord && !empty($todaysRecord['check_out'])): ?>
+                                Shift Concluded at <?php echo date('h:i A', strtotime($todaysRecord['check_out'])); ?>
+                            <?php else: ?>
+                                Scheduled Work Hours Have Ended
+                            <?php endif; ?>
+                        <?php elseif ($todayState === 'checked_in'): ?>
                             On Duty &bull; Punched In at <?php echo date('h:i A', strtotime($currentPunchIn)); ?>
                         <?php elseif ($todayState === 'checked_out'): ?>
                             Shift Concluded at <?php echo date('h:i A', strtotime($todaysRecord['check_out'])); ?>
@@ -1301,11 +1592,52 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                         <?php endif; ?>
                     </div>
 
+                    <?php if ($portalClosure['is_closed']): ?>
+                        <div class="portal-closure-box">
+                            <i class="fa-solid fa-lock" style="color:var(--att-danger); font-size:1.35rem; margin-top:2px;"></i>
+                            <div>
+                                <div style="font-weight:800; font-size:1rem; color:var(--att-danger); line-height:1.4;">
+                                    Your scheduled work hours have ended. Attendance access is now closed for today.
+                                </div>
+                                <div style="font-size:0.88rem; color:var(--att-text-muted); margin-top:4px; line-height:1.45;">
+                                    <?php echo htmlspecialchars($portalClosure['details']); ?>
+                                </div>
+                                <?php if (!empty($portalClosure['summary_pending']) || ($todaysRecord && ($todaysRecord['attendance_status'] ?? '') === 'summary_pending')): ?>
+                                    <div style="margin-top:8px;">
+                                        <span class="badge-status status-summary_pending" style="font-size:0.8rem; padding:4px 10px;">
+                                            <i class="fa-solid fa-file-pen"></i> Daily Summary Pending &bull; Check your email for secure submission link
+                                        </span>
+                                    </div>
+                                <?php elseif ($portalClosure['needs_hr_review']): ?>
+                                    <div style="margin-top:8px;">
+                                        <span class="badge-flagged-review"><i class="fa-solid fa-clock-rotate-left"></i> Flagged for HR Review &bull; Check-in preserved</span>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    <?php endif; ?>
+
                     <div class="status-details-row">
                         <div class="detail-item">
                             <span class="detail-label">Today's Date</span>
                             <span class="detail-val"><?php echo date('M d, Y'); ?></span>
                         </div>
+
+                        <div class="detail-item">
+                            <span class="detail-label">Scheduled Cutoff</span>
+                            <span class="detail-val" style="color:var(--att-text); font-weight:700;">
+                                <i class="fa-solid fa-clock"></i> <?php echo $portalClosure['scheduled_checkout_time']; ?>
+                            </span>
+                        </div>
+
+                        <?php if (!$portalClosure['is_closed']): ?>
+                            <div class="detail-item">
+                                <span class="detail-label">Remaining Time</span>
+                                <span class="detail-val" id="portalRemainingTimeDisplay" style="color:var(--att-brand); font-weight:700; font-variant-numeric:tabular-nums;">
+                                    <?php echo $portalClosure['time_remaining_text']; ?>
+                                </span>
+                            </div>
+                        <?php endif; ?>
 
                         <?php if ($todaysRecord && !empty($todaysRecord['check_in'])): ?>
                             <div class="detail-item">
@@ -1323,6 +1655,13 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                                 <span class="detail-label">Total Work Duration</span>
                                 <span class="detail-val" style="color:var(--att-brand);">
                                     <?php echo (float)$todaysRecord['working_hours']; ?> hours
+                                </span>
+                            </div>
+                        <?php elseif ($portalClosure['needs_hr_review']): ?>
+                            <div class="detail-item">
+                                <span class="detail-label">Check-Out Status</span>
+                                <span class="detail-val" style="color:var(--att-warning); font-weight:700;">
+                                    Pending HR Review
                                 </span>
                             </div>
                         <?php endif; ?>
@@ -1350,7 +1689,34 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
                 <!-- Right: Single Primary Action -->
                 <div class="primary-action-wrap">
-                    <?php if ($todayState === 'not_checked_in'): ?>
+                    <?php if ($portalClosure['is_closed']): ?>
+                        <div style="display:flex; flex-direction:column; gap:8px; align-items:flex-end;">
+                            <button type="button" class="btn-punch btn-punch-closed" disabled>
+                                <i class="fa-solid fa-lock"></i>
+                                <span>Portal Access Closed</span>
+                            </button>
+                            <div class="action-subtext" style="color:var(--att-danger); font-weight:600;">
+                                <i class="fa-solid fa-ban"></i> Attendance access is now closed for today
+                            </div>
+                            <?php if ($todaysRecord && (!empty($todaysRecord['work_summary']) || !empty($todaysRecord['completed_tasks']))): ?>
+                                <button type="button" class="btn-view-summary" style="padding: 10px 18px; font-size: 0.88rem; margin-top:4px;" onclick="openViewSummaryModal(<?php echo htmlspecialchars(json_encode([
+                                    'date'            => date('D, M j, Y', strtotime($todaysRecord['date'])),
+                                    'status'          => ucfirst(str_replace('_', ' ', $todaysRecord['attendance_status'] ?? ($todaysRecord['status'] ?? 'present'))),
+                                    'check_in'        => date('h:i A', strtotime($todaysRecord['check_in'])),
+                                    'check_out'       => !empty($todaysRecord['check_out']) ? date('h:i A', strtotime($todaysRecord['check_out'])) : 'N/A (Flagged for HR)',
+                                    'hours'           => ($todaysRecord['working_hours'] ?: '0.00') . ' hrs',
+                                    'work_summary'    => $todaysRecord['work_summary'] ?? '',
+                                    'completed_tasks' => $todaysRecord['completed_tasks'] ?? '',
+                                    'pending_tasks'   => $todaysRecord['pending_tasks'] ?? '',
+                                    'leave_code'      => $todaysRecord['leave_code'] ?? '',
+                                    'check_in_dist'   => $todaysRecord['check_in_dist'] ?? null,
+                                    'check_out_dist'  => $todaysRecord['check_out_dist'] ?? null
+                                ]), ENT_QUOTES, 'UTF-8'); ?>)">
+                                    <i class="fa-solid fa-file-lines"></i> View Today's Summary
+                                </button>
+                            <?php endif; ?>
+                        </div>
+                    <?php elseif ($todayState === 'not_checked_in'): ?>
                         <?php if ($todayRequest && $todayRequest['status'] === 'pending'): ?>
                             <button type="button" class="btn-punch" style="background:var(--att-surface-subtle); color:var(--att-text-muted); border:1.5px solid var(--att-border); cursor:not-allowed;" disabled>
                                 <i class="fa-solid fa-hourglass-half"></i>
@@ -1680,6 +2046,7 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                             <tr>
                                 <th>Date</th>
                                 <th>Status</th>
+                                <th>Scheduled Shift</th>
                                 <th>Check In</th>
                                 <th>Check Out</th>
                                 <th>Working Hours</th>
@@ -1688,66 +2055,134 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                             </tr>
                         </thead>
                         <tbody>
-                            <?php foreach ($history as $row): ?>
+                            <?php foreach ($history as $row): 
+                                $disp = AttendanceHelper::formatRecentAttendanceRecord($row, $portalClosure['is_closed'], $today);
+                            ?>
                                 <tr>
-                                    <td style="font-weight: 700;">
+                                    <!-- 1. Date -->
+                                    <td style="font-weight: 700; white-space: nowrap;">
                                         <div style="display:flex; align-items:center; gap:8px;">
                                             <i class="fa-regular fa-calendar" style="color:var(--att-text-muted); font-size:0.85rem;"></i>
-                                            <span><?php echo date('D, M j, Y', strtotime($row['date'])); ?></span>
+                                            <span><?php echo htmlspecialchars($disp['date_formatted']); ?></span>
                                         </div>
+                                        <?php if ($disp['is_overnight']): ?>
+                                            <div class="badge-overnight" title="Overnight shift spans into <?php echo htmlspecialchars($disp['overnight_next_long']); ?>">
+                                                <i class="fa-solid fa-moon"></i> Overnight &rarr; <?php echo htmlspecialchars($disp['overnight_next_short']); ?>
+                                            </div>
+                                        <?php endif; ?>
                                         <?php if (!empty($row['leave_code'])): ?>
-                                            <div style="font-size:0.75rem; color:var(--att-text-muted); font-weight:500; margin-top:2px;">
-                                                Note: <?php echo htmlspecialchars($row['leave_code']); ?>
+                                            <div class="history-sub-note">Note: <?php echo htmlspecialchars($row['leave_code']); ?></div>
+                                        <?php endif; ?>
+                                    </td>
+
+                                    <!-- 2. Status -->
+                                    <td>
+                                        <span class="badge-status status-<?php echo htmlspecialchars($disp['status_key']); ?>">
+                                            <i class="<?php echo htmlspecialchars($disp['status_icon']); ?>" style="font-size:0.55rem;"></i>
+                                            <?php echo htmlspecialchars($disp['status_label']); ?>
+                                        </span>
+                                        <?php if (!empty($row['flag_reason']) && $disp['status_key'] === 'pending_hr_review'): ?>
+                                            <div class="history-sub-note" style="color:#dc2626;" title="<?php echo htmlspecialchars($row['flag_reason']); ?>">
+                                                <i class="fa-solid fa-circle-exclamation"></i> <?php echo htmlspecialchars(mb_strimwidth($row['flag_reason'], 0, 22, '...')); ?>
                                             </div>
                                         <?php endif; ?>
                                     </td>
+
+                                    <!-- 3. Scheduled Shift -->
                                     <td>
-                                        <?php
-                                            $st = strtolower($row['attendance_status'] ?? ($row['status'] ?? 'present'));
-                                            $label = ucfirst(str_replace('_', ' ', $st));
-                                        ?>
-                                        <span class="badge-status status-<?php echo htmlspecialchars($st); ?>">
-                                            <i class="fa-solid fa-circle" style="font-size:0.4rem;"></i>
-                                            <?php echo htmlspecialchars($label); ?>
-                                        </span>
-                                    </td>
-                                    <td style="font-weight: 600;">
-                                        <?php echo $row['check_in'] ? date('h:i A', strtotime($row['check_in'])) : '&mdash;'; ?>
-                                    </td>
-                                    <td style="font-weight: 600;">
-                                        <?php echo $row['check_out'] ? date('h:i A', strtotime($row['check_out'])) : '&mdash;'; ?>
-                                    </td>
-                                    <td style="font-weight: 700;">
-                                        <?php echo ($row['working_hours'] > 0) ? $row['working_hours'] . ' hrs' : '&mdash;'; ?>
-                                    </td>
-                                    <td style="font-size: 0.82rem; color: var(--att-text-muted);">
-                                        <?php if ($row['check_in_dist'] !== null): ?>
-                                            <span><i class="fa-solid fa-location-dot" style="color:var(--att-success);"></i> <?php echo (int)$row['check_in_dist']; ?>m</span>
-                                        <?php elseif ($workMode === 'wfh'): ?>
-                                            <span><i class="fa-solid fa-house-laptop"></i> Remote</span>
+                                        <?php if ($disp['has_schedule']): ?>
+                                            <div class="shift-schedule-text"><?php echo htmlspecialchars($disp['shift_schedule_text']); ?></div>
+                                            <span class="shift-schedule-sub"><?php echo htmlspecialchars($disp['shift_name']); ?></span>
+                                            <?php if (!empty($disp['shift_exception_mode'])): ?>
+                                                <span class="badge-custom-shift"><i class="fa-solid fa-user-check"></i> <?php echo htmlspecialchars($disp['shift_exception_mode']); ?></span>
+                                            <?php endif; ?>
                                         <?php else: ?>
-                                            <span>&mdash;</span>
+                                            <span style="color:var(--att-text-muted); font-style:italic; font-size:0.85rem;">Schedule unavailable</span>
                                         <?php endif; ?>
                                     </td>
+
+                                    <!-- 4. Check In -->
+                                    <td style="font-weight: 600; white-space: nowrap;">
+                                        <?php echo htmlspecialchars($disp['check_in_formatted']); ?>
+                                    </td>
+
+                                    <!-- 5. Check Out -->
+                                    <td style="font-weight: 600; white-space: nowrap;">
+                                        <?php if ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:#d97706; font-style:italic; font-size:0.86rem;">
+                                                <i class="fa-solid fa-clock"></i> Pending Summary
+                                            </span>
+                                        <?php elseif ($disp['has_check_out']): ?>
+                                            <span><?php echo htmlspecialchars($disp['check_out_formatted']); ?></span>
+                                            <?php if (!empty($disp['is_scheduled_auto'])): ?>
+                                                <div class="badge-auto-sched" title="Finalized automatically using scheduled shift cutoff">
+                                                    <i class="fa-solid fa-robot"></i> Scheduled Auto
+                                                </div>
+                                            <?php endif; ?>
+                                        <?php elseif ($disp['has_check_in']): ?>
+                                            <span class="text-missing-checkout"><i class="fa-regular fa-clock"></i> Not checked out</span>
+                                        <?php else: ?>
+                                            <span style="color:var(--att-text-muted);">&mdash;</span>
+                                        <?php endif; ?>
+                                    </td>
+
+                                    <!-- 6. Working Hours -->
+                                    <td style="font-weight: 700; white-space: nowrap;">
+                                        <?php if (!$disp['has_check_in']): ?>
+                                            <span style="color:var(--att-text-muted);">&mdash;</span>
+                                        <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:var(--att-text-muted); font-size:0.85rem; font-style:italic;"><i class="fa-solid fa-clock"></i> Pending summary</span>
+                                        <?php elseif (!$disp['has_check_out']): ?>
+                                            <?php if ($disp['status_key'] === 'in_progress'): ?>
+                                                <span class="hours-in-progress"><i class="fa-solid fa-spinner fa-spin"></i> In progress</span>
+                                            <?php else: ?>
+                                                <span class="hours-pending"><i class="fa-solid fa-hourglass-half"></i> Pending checkout</span>
+                                            <?php endif; ?>
+                                        <?php else: ?>
+                                            <span style="color:var(--att-text);"><?php echo htmlspecialchars($disp['working_hours_display']); ?></span>
+                                        <?php endif; ?>
+                                    </td>
+
+                                    <!-- 7. Location Info -->
+                                    <td style="font-size: 0.82rem; white-space: nowrap;">
+                                        <?php if ($disp['loc_type'] === 'verified'): ?>
+                                            <div class="badge-loc loc-verified"><i class="fa-solid fa-circle-check"></i> <?php echo htmlspecialchars($disp['loc_text']); ?></div>
+                                            <?php if (!empty($disp['loc_sub'])): ?>
+                                                <div class="shift-schedule-sub"><?php echo htmlspecialchars($disp['loc_sub']); ?></div>
+                                            <?php endif; ?>
+                                        <?php elseif ($disp['loc_type'] === 'remote'): ?>
+                                            <span class="badge-loc loc-remote"><i class="fa-solid fa-house-laptop"></i> <?php echo htmlspecialchars($disp['loc_text']); ?></span>
+                                        <?php elseif ($disp['loc_type'] === 'exception'): ?>
+                                            <span class="badge-loc loc-exception"><i class="fa-solid fa-briefcase"></i> <?php echo htmlspecialchars($disp['loc_text']); ?></span>
+                                        <?php else: ?>
+                                            <span class="badge-loc loc-missing"><i class="fa-solid fa-location-slash"></i> GPS not recorded</span>
+                                        <?php endif; ?>
+                                    </td>
+
+                                    <!-- 8. Daily Summary -->
                                     <td>
-                                        <?php if (!empty($row['work_summary']) || !empty($row['completed_tasks'])): ?>
+                                        <?php if ($disp['has_summary']): ?>
                                             <button type="button" class="btn-view-summary" onclick="openViewSummaryModal(<?php echo htmlspecialchars(json_encode([
-                                                'date'            => date('D, M j, Y', strtotime($row['date'])),
-                                                'status'          => ucfirst(str_replace('_', ' ', $row['attendance_status'] ?? ($row['status'] ?? 'present'))),
-                                                'check_in'        => $row['check_in'] ? date('h:i A', strtotime($row['check_in'])) : '—',
-                                                'check_out'       => $row['check_out'] ? date('h:i A', strtotime($row['check_out'])) : '—',
-                                                'hours'           => ($row['working_hours'] > 0) ? $row['working_hours'] . ' hrs' : '—',
-                                                'work_summary'    => $row['work_summary'] ?? '',
-                                                'completed_tasks' => $row['completed_tasks'] ?? '',
-                                                'pending_tasks'   => $row['pending_tasks'] ?? '',
+                                                'date'            => $disp['date_formatted'],
+                                                'shift'           => $disp['shift_schedule_text'] . ($disp['shift_name'] ? ' (' . $disp['shift_name'] . ')' : ''),
+                                                'status'          => $disp['status_label'],
+                                                'check_in'        => $disp['check_in_formatted'],
+                                                'check_out'       => $disp['check_out_formatted'],
+                                                'hours'           => $disp['working_hours_display'],
+                                                'work_summary'    => $disp['final_work_summary'],
+                                                'completed_tasks' => $disp['final_completed_tasks'],
+                                                'pending_tasks'   => $disp['final_pending_tasks'],
                                                 'leave_code'      => $row['leave_code'] ?? '',
                                                 'check_in_dist'   => $row['check_in_dist'] ?? null,
-                                                'check_out_dist'  => $row['check_out_dist'] ?? null
+                                                'check_out_dist'  => $row['check_out_dist'] ?? null,
+                                                'location_info'   => $disp['loc_text']
                                             ]), ENT_QUOTES, 'UTF-8'); ?>)">
-                                                <i class="fa-solid fa-file-lines"></i> View
+                                                <i class="fa-solid fa-file-lines"></i> View Summary
                                             </button>
+                                        <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:#d97706; font-size:0.82rem; font-weight:600;"><i class="fa-solid fa-pen-to-square"></i> Awaiting Summary</span>
                                         <?php else: ?>
-                                            <span style="color:var(--att-text-muted); font-size:0.8rem;">&mdash;</span>
+                                            <span style="color:var(--att-text-muted); font-size:0.82rem; font-style:italic;">Not submitted</span>
                                         <?php endif; ?>
                                     </td>
                                 </tr>
@@ -1758,53 +2193,131 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
                 <!-- Mobile Card List View (< 720px) -->
                 <div class="mobile-history-list">
-                    <?php foreach ($history as $row): ?>
+                    <?php foreach ($history as $row): 
+                        $disp = AttendanceHelper::formatRecentAttendanceRecord($row, $portalClosure['is_closed'], $today);
+                    ?>
                         <div class="mobile-card">
+                            <!-- 1. Date & 2. Status -->
                             <div class="mobile-card-top">
-                                <span style="font-weight: 800; font-size: 0.92rem;">
-                                    <?php echo date('D, M j', strtotime($row['date'])); ?>
-                                </span>
-                                <?php
-                                    $st = strtolower($row['attendance_status'] ?? ($row['status'] ?? 'present'));
-                                    $label = ucfirst(str_replace('_', ' ', $st));
-                                ?>
-                                <span class="badge-status status-<?php echo htmlspecialchars($st); ?>">
-                                    <?php echo htmlspecialchars($label); ?>
+                                <div>
+                                    <div style="font-weight: 800; font-size: 0.92rem; display: flex; align-items: center; gap: 6px;">
+                                        <i class="fa-regular fa-calendar" style="color:var(--att-text-muted); font-size: 0.85rem;"></i>
+                                        <span><?php echo htmlspecialchars($disp['date_formatted']); ?></span>
+                                    </div>
+                                    <?php if ($disp['is_overnight']): ?>
+                                        <div class="badge-overnight">
+                                            <i class="fa-solid fa-moon"></i> Overnight &rarr; <?php echo htmlspecialchars($disp['overnight_next_short']); ?>
+                                        </div>
+                                    <?php endif; ?>
+                                    <?php if (!empty($row['leave_code'])): ?>
+                                        <div class="history-sub-note">Note: <?php echo htmlspecialchars($row['leave_code']); ?></div>
+                                    <?php endif; ?>
+                                </div>
+                                <span class="badge-status status-<?php echo htmlspecialchars($disp['status_key']); ?>">
+                                    <i class="<?php echo htmlspecialchars($disp['status_icon']); ?>" style="font-size:0.55rem;"></i>
+                                    <?php echo htmlspecialchars($disp['status_label']); ?>
                                 </span>
                             </div>
 
+                            <!-- 3. Scheduled Shift -->
+                            <div class="mobile-card-row">
+                                <span class="detail-label"><i class="fa-regular fa-clock" style="color:var(--att-text-muted);"></i> Scheduled Shift</span>
+                                <span class="detail-val" style="text-align: right;">
+                                    <?php if ($disp['has_schedule']): ?>
+                                        <span style="font-weight:600; font-size:0.86rem;"><?php echo htmlspecialchars($disp['shift_schedule_text']); ?></span>
+                                        <span class="shift-schedule-sub"><?php echo htmlspecialchars($disp['shift_name']); ?></span>
+                                    <?php else: ?>
+                                        <span style="color:var(--att-text-muted); font-style:italic; font-size:0.82rem;">Schedule unavailable</span>
+                                    <?php endif; ?>
+                                </span>
+                            </div>
+
+                            <!-- 4. Check In, 5. Check Out, 6. Working Hours -->
                             <div class="mobile-grid-row">
                                 <div class="detail-item">
-                                    <span class="detail-label">In</span>
-                                    <span class="detail-val" style="font-size:0.9rem;"><?php echo $row['check_in'] ? date('h:i A', strtotime($row['check_in'])) : '&mdash;'; ?></span>
+                                    <span class="detail-label">Check In</span>
+                                    <span class="detail-val" style="font-size:0.88rem; font-weight:600;"><?php echo htmlspecialchars($disp['check_in_formatted']); ?></span>
                                 </div>
                                 <div class="detail-item">
-                                    <span class="detail-label">Out</span>
-                                    <span class="detail-val" style="font-size:0.9rem;"><?php echo $row['check_out'] ? date('h:i A', strtotime($row['check_out'])) : '&mdash;'; ?></span>
+                                    <span class="detail-label">Check Out</span>
+                                    <span class="detail-val" style="font-size:0.88rem; font-weight:600;">
+                                        <?php if ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="color:#d97706; font-size:0.78rem; font-weight:600;">Pending</span>
+                                        <?php elseif ($disp['has_check_out']): ?>
+                                            <?php echo htmlspecialchars($disp['check_out_formatted']); ?>
+                                            <?php if (!empty($disp['is_scheduled_auto'])): ?>
+                                                <div class="badge-auto-sched" style="font-size:0.65rem; padding:1px 4px;">(Auto)</div>
+                                            <?php endif; ?>
+                                        <?php elseif ($disp['has_check_in']): ?>
+                                            <span style="color:var(--att-warning); font-size:0.78rem;">Missing</span>
+                                        <?php else: ?>
+                                            &mdash;
+                                        <?php endif; ?>
+                                    </span>
                                 </div>
                                 <div class="detail-item">
                                     <span class="detail-label">Hours</span>
-                                    <span class="detail-val" style="font-size:0.9rem; color:var(--att-brand);"><?php echo ($row['working_hours'] > 0) ? $row['working_hours'] . 'h' : '&mdash;'; ?></span>
+                                    <span class="detail-val" style="font-size:0.88rem; font-weight:700;">
+                                        <?php if (!$disp['has_check_in']): ?>
+                                            &mdash;
+                                        <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                            <span style="font-size:0.78rem; color:#d97706;">Pending</span>
+                                        <?php elseif (!$disp['has_check_out']): ?>
+                                            <span style="font-size:0.78rem; color:<?php echo ($disp['status_key'] === 'in_progress' ? '#2563eb' : '#dc2626'); ?>;">
+                                                <?php echo htmlspecialchars($disp['working_hours_display']); ?>
+                                            </span>
+                                        <?php else: ?>
+                                            <span style="color:var(--att-brand);"><?php echo htmlspecialchars($disp['working_hours_display']); ?></span>
+                                        <?php endif; ?>
+                                    </span>
                                 </div>
                             </div>
 
-                            <?php if (!empty($row['work_summary']) || !empty($row['completed_tasks'])): ?>
+                            <!-- 7. Location Info -->
+                            <div class="mobile-card-row">
+                                <span class="detail-label"><i class="fa-solid fa-location-dot" style="color:var(--att-text-muted);"></i> Location</span>
+                                <span class="detail-val" style="text-align: right;">
+                                    <?php if ($disp['loc_type'] === 'verified'): ?>
+                                        <span class="badge-loc loc-verified"><i class="fa-solid fa-circle-check"></i> <?php echo htmlspecialchars($disp['loc_text']); ?></span>
+                                    <?php elseif ($disp['loc_type'] === 'remote'): ?>
+                                        <span class="badge-loc loc-remote"><i class="fa-solid fa-house-laptop"></i> <?php echo htmlspecialchars($disp['loc_text']); ?></span>
+                                    <?php elseif ($disp['loc_type'] === 'exception'): ?>
+                                        <span class="badge-loc loc-exception"><i class="fa-solid fa-briefcase"></i> <?php echo htmlspecialchars($disp['loc_text']); ?></span>
+                                    <?php else: ?>
+                                        <span class="badge-loc loc-missing"><i class="fa-solid fa-location-slash"></i> GPS not recorded</span>
+                                    <?php endif; ?>
+                                </span>
+                            </div>
+
+                            <!-- 8. Daily Summary -->
+                            <?php if ($disp['has_summary']): ?>
                                 <div style="margin-top: 4px;">
                                     <button type="button" class="btn-view-summary" style="width: 100%; justify-content: center;" onclick="openViewSummaryModal(<?php echo htmlspecialchars(json_encode([
-                                        'date'            => date('D, M j, Y', strtotime($row['date'])),
-                                        'status'          => ucfirst(str_replace('_', ' ', $row['attendance_status'] ?? ($row['status'] ?? 'present'))),
-                                        'check_in'        => $row['check_in'] ? date('h:i A', strtotime($row['check_in'])) : '—',
-                                        'check_out'       => $row['check_out'] ? date('h:i A', strtotime($row['check_out'])) : '—',
-                                        'hours'           => ($row['working_hours'] > 0) ? $row['working_hours'] . ' hrs' : '—',
-                                        'work_summary'    => $row['work_summary'] ?? '',
-                                        'completed_tasks' => $row['completed_tasks'] ?? '',
-                                        'pending_tasks'   => $row['pending_tasks'] ?? '',
+                                        'date'            => $disp['date_formatted'],
+                                        'shift'           => $disp['shift_schedule_text'] . ($disp['shift_name'] ? ' (' . $disp['shift_name'] . ')' : ''),
+                                        'status'          => $disp['status_label'],
+                                        'check_in'        => $disp['check_in_formatted'],
+                                        'check_out'       => $disp['check_out_formatted'],
+                                        'hours'           => $disp['working_hours_display'],
+                                        'work_summary'    => $disp['final_work_summary'],
+                                        'completed_tasks' => $disp['final_completed_tasks'],
+                                        'pending_tasks'   => $disp['final_pending_tasks'],
                                         'leave_code'      => $row['leave_code'] ?? '',
                                         'check_in_dist'   => $row['check_in_dist'] ?? null,
-                                        'check_out_dist'  => $row['check_out_dist'] ?? null
+                                        'check_out_dist'  => $row['check_out_dist'] ?? null,
+                                        'location_info'   => $disp['loc_text']
                                     ]), ENT_QUOTES, 'UTF-8'); ?>)">
-                                        <i class="fa-solid fa-file-lines"></i> View Work Summary
+                                        <i class="fa-solid fa-file-lines"></i> View Daily Summary
                                     </button>
+                                </div>
+                            <?php elseif ($disp['status_key'] === 'summary_pending'): ?>
+                                <div style="margin-top: 4px; text-align: center; padding: 6px; background: rgba(245, 158, 11, 0.1); border-radius: 8px; color: #d97706; font-size: 0.8rem; font-weight: 600;">
+                                    <i class="fa-solid fa-pen-to-square"></i> Awaiting Daily Summary
+                                </div>
+                            <?php else: ?>
+                                <div class="mobile-card-row" style="border-bottom: none;">
+                                    <span class="detail-label"><i class="fa-solid fa-file-lines" style="color:var(--att-text-muted);"></i> Daily Summary</span>
+                                    <span class="detail-val" style="color:var(--att-text-muted); font-style:italic; font-size:0.82rem;">Not submitted</span>
                                 </div>
                             <?php endif; ?>
                         </div>
@@ -1927,6 +2440,23 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         const canCheckInNow = <?php echo ($scheduledWindowCheck ? ($scheduledWindowCheck['can_check_in'] ? 'true' : 'false') : 'true'); ?>;
         const scheduledCheckInMessage = <?php echo json_encode($scheduledWindowCheck['message'] ?? ''); ?>;
 
+        // Authoritative Server-Synchronized Portal Closure Parameters
+        const isPortalClosedInitial = <?php echo $portalClosure['is_closed'] ? 'true' : 'false'; ?>;
+        const scheduledCutoffTs = <?php echo (int)$portalClosure['scheduled_checkout_ts']; ?>;
+        const serverClockSkewMs = <?php echo (time() * 1000); ?> - Date.now();
+
+        function getAuthoritativeServerTimeSec() {
+            return Math.floor((Date.now() + serverClockSkewMs) / 1000);
+        }
+
+        function isPortalClosedNow() {
+            if (isPortalClosedInitial) return true;
+            if (scheduledCutoffTs > 0 && getAuthoritativeServerTimeSec() >= scheduledCutoffTs) {
+                return true;
+            }
+            return false;
+        }
+
         let lastCapturedCoords = { lat: null, lng: null, dist: null };
 
         function showGpsNotice(msg, type = 'error') {
@@ -1955,6 +2485,12 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
 
         // ── 1. CHECK-IN HANDLER (GEOFENCE & SCHEDULED-TIME VERIFICATION) ──
         function triggerCheckIn() {
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                showGpsNotice("Your scheduled work hours have ended. Attendance access is now closed for today.", "error");
+                return;
+            }
+
             const btn = document.getElementById('btnCheckIn');
             hideGpsNotice();
 
@@ -2054,6 +2590,12 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         // ── 3. ATTENDANCE REQUEST MODAL (WFH & ON-SITE EXCEPTION) ──
         const attendanceRequestModal = document.getElementById('attendanceRequestModal');
         function openRequestModal(mode = 'wfh') {
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                alert("Your scheduled work hours have ended. Attendance access is now closed for today.");
+                return;
+            }
+
             closeLocationMismatchModal();
             if (!attendanceRequestModal) return;
 
@@ -2130,6 +2672,11 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         // ── 4. CHECK-OUT MODAL HANDLERS ──
         const checkoutModal = document.getElementById('checkoutModal');
         function openCheckoutModal() {
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                alert("Your scheduled work hours have ended. Attendance access is now closed for today.");
+                return;
+            }
             if (checkoutModal) checkoutModal.style.display = 'flex';
         }
         function closeCheckoutModal() {
@@ -2139,6 +2686,18 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         // Handle Checkout Form Submission (with GPS for on-site staff)
         function handleCheckoutSubmit(e) {
             e.preventDefault();
+
+            if (isPortalClosedNow()) {
+                triggerPortalClosureLock();
+                const errBox = document.getElementById('checkoutModalError');
+                if (errBox) {
+                    errBox.style.display = 'block';
+                    errBox.textContent = "Your scheduled work hours have ended. Attendance access is now closed for today.";
+                } else {
+                    alert("Your scheduled work hours have ended. Attendance access is now closed for today.");
+                }
+                return false;
+            }
 
             const summary = document.getElementById('work_summary')?.value.trim();
             const completed = document.getElementById('completed_tasks')?.value.trim();
@@ -2215,7 +2774,19 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         const viewSummaryModal = document.getElementById('viewSummaryModal');
         function openViewSummaryModal(data) {
             if (!viewSummaryModal) return;
-            document.getElementById('viewSummaryMeta').textContent = data.date + ' • Status: ' + data.status + ' • Work Hours: ' + data.hours;
+
+            let metaParts = [data.date];
+            if (data.shift && data.shift !== 'Schedule unavailable') {
+                metaParts.push('Shift: ' + data.shift);
+            }
+            if (data.status) {
+                metaParts.push('Status: ' + data.status);
+            }
+            if (data.hours && data.hours !== '—') {
+                metaParts.push('Hours: ' + data.hours);
+            }
+            document.getElementById('viewSummaryMeta').textContent = metaParts.join(' • ');
+
             document.getElementById('viewWorkSummaryText').textContent = data.work_summary || 'No summary provided.';
             document.getElementById('viewCompletedTasksText').textContent = data.completed_tasks || 'No completed tasks recorded.';
 
@@ -2235,6 +2806,9 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
                     gpsTxt += ` &bull; Check-out was <strong>${data.check_out_dist} meters</strong> from office.`;
                 }
                 gpsWrap.innerHTML = gpsTxt;
+            } else if (data.location_info && data.location_info !== 'GPS not recorded') {
+                gpsWrap.style.display = 'block';
+                gpsWrap.innerHTML = `<i class="fa-solid fa-circle-info" style="color:var(--att-brand);"></i> Location Mode: <strong>${data.location_info}</strong>`;
             } else {
                 gpsWrap.style.display = 'none';
             }
@@ -2271,6 +2845,114 @@ $csrfToken = Security::generateCSRFToken('attendance_action');
         viewSummaryModal?.addEventListener('click', (e) => {
             if (e.target === viewSummaryModal) closeViewSummaryModal();
         });
+
+        // ── 6. REAL-TIME COUNTDOWN, AUTO-CLOSURE LOCK & SERVER HEARTBEAT ──
+        function formatRemainingTime(seconds) {
+            if (seconds <= 0) return '00h 00m 00s';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            return String(h).padStart(2, '0') + 'h ' + String(m).padStart(2, '0') + 'm ' + String(s).padStart(2, '0') + 's';
+        }
+
+        let warningTriggered15m = false;
+        let warningTriggered5m = false;
+
+        function updateClientPortalCutoffTimer() {
+            if (isPortalClosedInitial) return;
+            const nowSec = getAuthoritativeServerTimeSec();
+            const remainingSec = Math.max(0, scheduledCutoffTs - nowSec);
+
+            const displayEl = document.getElementById('portalRemainingTimeDisplay');
+            if (displayEl) {
+                displayEl.textContent = formatRemainingTime(remainingSec);
+            }
+
+            // Cutoff Warning at 15 minutes remaining
+            if (remainingSec > 0 && remainingSec <= 900 && !warningTriggered15m) {
+                warningTriggered15m = true;
+                showCutoffWarningBanner(15);
+            }
+
+            // Cutoff Warning at 5 minutes remaining
+            if (remainingSec > 0 && remainingSec <= 300 && !warningTriggered5m) {
+                warningTriggered5m = true;
+                showCutoffWarningBanner(5);
+            }
+
+            // Cutoff reached! Trigger immediate client-side lock
+            if (remainingSec <= 0) {
+                triggerPortalClosureLock();
+            }
+        }
+
+        function showCutoffWarningBanner(minutes) {
+            const banner = document.getElementById('portalCutoffWarningBanner');
+            if (banner) {
+                banner.style.display = 'flex';
+                banner.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> <span><strong>Shift Cutoff Warning:</strong> Your scheduled work shift ends in less than ${minutes} minutes. Please complete check-out and submit your daily work summary prior to access closure.</span>`;
+            }
+        }
+
+        function triggerPortalClosureLock() {
+            // Dismiss active interactive modals immediately
+            closeCheckoutModal();
+            closeRequestModal();
+            closeLocationMismatchModal();
+
+            // Disable check-in button if present
+            const btnIn = document.getElementById('btnCheckIn');
+            if (btnIn) {
+                btnIn.disabled = true;
+                btnIn.className = 'btn-punch btn-punch-closed';
+                btnIn.innerHTML = '<i class="fa-solid fa-lock"></i> <span>Portal Access Closed</span>';
+            }
+
+            // Disable check-out button if present
+            const btnOut = document.getElementById('btnOpenCheckoutModal');
+            if (btnOut) {
+                btnOut.disabled = true;
+                btnOut.className = 'btn-punch btn-punch-closed';
+                btnOut.innerHTML = '<i class="fa-solid fa-lock"></i> <span>Portal Access Closed</span>';
+            }
+
+            // Hide cutoff warning banner if showing
+            const warningBanner = document.getElementById('portalCutoffWarningBanner');
+            if (warningBanner) {
+                warningBanner.style.display = 'none';
+            }
+
+            // Display live closure alert banner
+            const liveAlert = document.getElementById('portalClosureLiveAlert');
+            if (liveAlert) {
+                liveAlert.style.display = 'flex';
+            }
+
+            // Update remaining time display
+            const displayEl = document.getElementById('portalRemainingTimeDisplay');
+            if (displayEl) {
+                displayEl.textContent = '00h 00m 00s (Closed)';
+                displayEl.style.color = 'var(--att-danger)';
+            }
+        }
+
+        // Heartbeat API poll every 30 seconds to sync with authoritative server state
+        function pollServerClosureStatus() {
+            fetch('employee_attendance?action=check_portal_status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.is_closed) {
+                        triggerPortalClosureLock();
+                    }
+                })
+                .catch(() => {});
+        }
+
+        if (!isPortalClosedInitial && scheduledCutoffTs > 0) {
+            setInterval(updateClientPortalCutoffTimer, 1000);
+            setInterval(pollServerClosureStatus, 30000);
+            updateClientPortalCutoffTimer();
+        }
     </script>
 </body>
 </html>
