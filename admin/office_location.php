@@ -283,14 +283,22 @@ include 'header.php';
             </h1>
         </div>
 
-        <div style="display: flex; gap: 10px;">
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
             <a href="settings" class="btn-saas" style="padding: 8px 16px; border-radius: var(--adm-radius-pill); background: var(--adm-surface); border: 1px solid var(--adm-border); color: var(--adm-text-body); font-size: 0.85rem; font-weight: 600; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;">
-                <i class="fa-solid fa-arrow-left"></i>
-                <span>Back to Settings</span>
+                <i class="fa-solid fa-user-gear"></i>
+                <span>Account</span>
+            </a>
+            <a href="site_settings" class="btn-saas" style="padding: 8px 16px; border-radius: var(--adm-radius-pill); background: var(--adm-surface); border: 1px solid var(--adm-border); color: var(--adm-text-body); font-size: 0.85rem; font-weight: 600; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;">
+                <i class="fa-solid fa-sliders"></i>
+                <span>Branding &amp; SMTP</span>
+            </a>
+            <a href="office_location" class="btn-saas" style="padding: 8px 16px; border-radius: var(--adm-radius-pill); background: var(--adm-brand); border: 1px solid var(--adm-brand); color: #ffffff; font-size: 0.85rem; font-weight: 700; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;">
+                <i class="fa-solid fa-location-dot"></i>
+                <span>Office GPS</span>
             </a>
             <a href="attendance" class="btn-saas" style="padding: 8px 16px; border-radius: var(--adm-radius-pill); background: var(--adm-brand-light); border: 1px solid var(--adm-brand-border); color: var(--adm-brand); font-size: 0.85rem; font-weight: 700; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;">
                 <i class="fa-solid fa-calendar-check"></i>
-                <span>Attendance Terminal</span>
+                <span>Attendance</span>
             </a>
         </div>
     </div>

@@ -2439,6 +2439,86 @@ class AttendanceHelper {
 
         return $stats;
     }
+
+    /**
+     * Check if a specific date is a working day, weekly off, or holiday
+     * Returns array ['day_type' => string, 'is_working' => bool, 'title' => string|null]
+     */
+    public static function getDayScheduleType($pdo, $date) {
+        if (empty($date) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+            return ['day_type' => 'working_day', 'is_working' => true, 'title' => null];
+        }
+
+        try {
+            $stmt = $pdo->prepare("SELECT day_type, title FROM monthly_working_days WHERE `date` = ? LIMIT 1");
+            $stmt->execute([$date]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($row) {
+                return [
+                    'day_type' => $row['day_type'],
+                    'is_working' => ($row['day_type'] === 'working_day'),
+                    'title' => $row['title']
+                ];
+            }
+        } catch (PDOException $e) {
+            // Fail safely to standard weekday check
+        }
+
+        // Default fallback: Sundays are weekly off, other days are working days
+        $w = (int)date('w', strtotime($date));
+        $isSunday = ($w === 0);
+        return [
+            'day_type' => $isSunday ? 'weekly_off' : 'working_day',
+            'is_working' => !$isSunday,
+            'title' => $isSunday ? 'Sunday Off' : null
+        ];
+    }
+
+    /**
+     * Get monthly working days summary counts (total, working days, weekly offs, holidays)
+     */
+    public static function getMonthWorkingDaysSummary($pdo, $year, $month) {
+        $firstDay = sprintf('%04d-%02d-01', (int)$year, (int)$month);
+        $totalDays = (int)date('t', strtotime($firstDay));
+
+        $workingDays = 0;
+        $weeklyOffs  = 0;
+        $holidays    = 0;
+
+        $saved = [];
+        try {
+            $stmt = $pdo->prepare("SELECT `date`, `day_type` FROM monthly_working_days WHERE `year` = ? AND `month` = ?");
+            $stmt->execute([(int)$year, (int)$month]);
+            while ($r = $stmt->fetch(PDO::FETCH_ASSOC)) {
+                $saved[$r['date']] = $r['day_type'];
+            }
+        } catch (PDOException $e) {
+            error_log("getMonthWorkingDaysSummary error: " . $e->getMessage());
+        }
+
+        for ($d = 1; $d <= $totalDays; $d++) {
+            $dt = sprintf('%04d-%02d-%02d', (int)$year, (int)$month, $d);
+            if (isset($saved[$dt])) {
+                $type = $saved[$dt];
+            } else {
+                $w = (int)date('w', strtotime($dt));
+                $type = ($w === 0) ? 'weekly_off' : 'working_day';
+            }
+
+            if ($type === 'working_day') $workingDays++;
+            elseif ($type === 'weekly_off') $weeklyOffs++;
+            elseif ($type === 'holiday') $holidays++;
+        }
+
+        return [
+            'total_days'   => $totalDays,
+            'working_days' => $workingDays,
+            'weekly_offs'  => $weeklyOffs,
+            'holidays'     => $holidays
+        ];
+    }
 }
+
 
 

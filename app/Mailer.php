@@ -547,6 +547,58 @@ class Mailer {
     }
 
     /**
+     * Send email to Employee when their leave request is approved
+     */
+    public function sendLeaveApprovalAlert($toEmail, $employeeName, $leaveType, $leaveCode, $startDate, $endDate, $days) {
+        if (empty($toEmail)) return false;
+
+        $mail = $this->getMailer();
+        if (!$mail) return false;
+
+        try {
+            $mail->addAddress($toEmail);
+            $mail->Subject = "Leave Request Approved &bull; {$leaveCode}";
+            $mail->Body    = "<h3>Your Leave Request Has Been Approved</h3>
+                              <p>Dear " . htmlspecialchars($employeeName) . ",</p>
+                              <p>Your request for <strong>" . htmlspecialchars($leaveType) . "</strong> has been approved by the administrator.</p>
+                              <div style='background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:16px;margin:16px 0;'>
+                                  <p style='margin:0 0 8px;'><strong>Official Leave Code:</strong> <span style='font-family:monospace;font-size:1.2em;color:#166534;font-weight:bold;'>" . htmlspecialchars($leaveCode) . "</span></p>
+                                  <p style='margin:0 0 8px;'><strong>Duration:</strong> " . (int)$days . " Day(s)</p>
+                                  <p style='margin:0;'><strong>Period:</strong> " . htmlspecialchars($startDate) . " to " . htmlspecialchars($endDate) . "</p>
+                              </div>
+                              <p>Your attendance roster has been updated accordingly.</p>";
+            return $mail->send();
+        } catch (Exception $e) {
+            error_log("Mailer Error (Leave Approval Alert): " . $mail->ErrorInfo);
+            return false;
+        }
+    }
+
+    /**
+     * Send email to Employee when their leave request is rejected
+     */
+    public function sendLeaveRejectionAlert($toEmail, $employeeName, $leaveType, $startDate, $endDate, $rejectionReason = '') {
+        if (empty($toEmail)) return false;
+
+        $mail = $this->getMailer();
+        if (!$mail) return false;
+
+        try {
+            $mail->addAddress($toEmail);
+            $mail->Subject = "Leave Request Update: Declined";
+            $mail->Body    = "<h3>Leave Request Update</h3>
+                              <p>Dear " . htmlspecialchars($employeeName) . ",</p>
+                              <p>Your request for <strong>" . htmlspecialchars($leaveType) . "</strong> from " . htmlspecialchars($startDate) . " to " . htmlspecialchars($endDate) . " could not be approved at this time.</p>
+                              " . (!empty($rejectionReason) ? "<p><strong>Reason provided:</strong> " . nl2br(htmlspecialchars($rejectionReason)) . "</p>" : "") . "
+                              <p>Please contact human resources or your administrator if you have any questions.</p>";
+            return $mail->send();
+        } catch (Exception $e) {
+            error_log("Mailer Error (Leave Rejection Alert): " . $mail->ErrorInfo);
+            return false;
+        }
+    }
+
+    /**
      * Send email to Admin when a project is submitted
      */
     public function sendProjectSubmissionAlert($employeeName, $projectTitle, $driveLink) {

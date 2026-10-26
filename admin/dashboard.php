@@ -439,26 +439,44 @@ try {
         border-color: var(--adm-brand-border);
     }
 
+    .dash-card {
+        background: var(--adm-surface-card);
+        border: 1px solid var(--adm-border);
+        border-radius: var(--adm-radius-lg);
+        padding: 18px 20px;
+        box-shadow: var(--adm-shadow-card);
+        transition: transform var(--adm-transition), box-shadow var(--adm-transition), border-color var(--adm-transition);
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+    }
+    .dash-card:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--adm-shadow-hover);
+        border-color: var(--adm-brand-border);
+    }
+
     .dash-card-top {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        margin-bottom: 16px;
+        gap: 12px;
+        margin-bottom: 10px;
     }
 
     .dash-card-icon {
-        width: 48px;
-        height: 48px;
+        width: 44px;
+        height: 44px;
         border-radius: var(--adm-radius-md);
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 1.25rem;
+        font-size: 1.15rem;
         box-shadow: 0 4px 12px rgba(0,0,0,0.06);
         transition: transform var(--adm-transition);
+        flex-shrink: 0;
     }
     .dash-card:hover .dash-card-icon {
-        transform: scale(1.08);
+        transform: scale(1.06);
     }
 
     .dash-card-icon--blue   { background: var(--adm-brand-light); color: var(--adm-brand); }
@@ -466,35 +484,13 @@ try {
     .dash-card-icon--orange { background: var(--adm-warning-light); color: var(--adm-warning); }
     .dash-card-icon--purple { background: rgba(139, 92, 246, 0.16); color: #8b5cf6; }
 
-    .dash-card-chip {
-        font-size: 0.72rem;
+    .dash-card-title {
+        font-size: 0.84rem;
         font-weight: 700;
         text-transform: uppercase;
         letter-spacing: 0.04em;
-        padding: 3px 8px;
-        border-radius: var(--adm-radius-pill);
-        background: var(--adm-surface-subtle);
-        color: var(--adm-faint);
-        border: 1px solid var(--adm-border-subtle);
-    }
-    .dash-card-chip.success {
-        background: var(--adm-success-light);
-        color: var(--adm-success);
-        border-color: rgba(5, 150, 105, 0.3);
-    }
-    .dash-card-chip.danger {
-        background: var(--adm-danger-light);
-        color: var(--adm-danger);
-        border-color: var(--adm-danger-border);
-    }
-
-    .dash-card-title {
-        font-size: 0.85rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
         color: var(--adm-muted);
-        margin-bottom: 6px;
+        margin: 0;
     }
 
     .dash-card-value {
@@ -502,39 +498,17 @@ try {
         font-size: 2.1rem;
         font-weight: 800;
         color: var(--adm-text-main);
-        line-height: 1.1;
+        line-height: 1;
         letter-spacing: -0.02em;
-        margin-bottom: 8px;
+        margin: 0;
     }
 
-    .dash-card-subtext {
-        font-size: 0.8rem;
-        color: var(--adm-faint);
-        display: flex;
-        align-items: center;
-        gap: 6px;
-    }
-
-    .dash-mini-progress {
-        height: 6px;
-        background: var(--adm-surface-subtle);
-        border-radius: var(--adm-radius-pill);
-        overflow: hidden;
-        margin-top: 10px;
-    }
-    .dash-mini-progress-fill {
-        height: 100%;
-        background: linear-gradient(90deg, #10b981, #059669);
-        border-radius: var(--adm-radius-pill);
-        transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-    }
-
-    /* ── Analytics & Visual Charts Grid ── */
+    /* ── Analytics & Visual Charts Grid (Compact Layout) ── */
     .charts-grid-layout {
         display: grid;
         grid-template-columns: 1.85fr 1fr;
-        gap: 24px;
-        margin-bottom: 32px;
+        gap: 16px;
+        margin-bottom: 20px;
         min-width: 0;
         max-width: 100%;
     }
@@ -546,8 +520,8 @@ try {
     .chart-panel-card {
         background: var(--adm-surface-card);
         border: 1px solid var(--adm-border);
-        border-radius: var(--adm-radius-xl);
-        padding: 28px;
+        border-radius: var(--adm-radius-lg);
+        padding: 16px 20px;
         box-shadow: var(--adm-shadow-card);
         transition: border-color 0.3s ease, box-shadow 0.3s ease;
         position: relative;
@@ -563,28 +537,28 @@ try {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 24px;
-        padding-bottom: 16px;
+        margin-bottom: 12px;
+        padding-bottom: 10px;
         border-bottom: 1px solid var(--adm-border-subtle);
     }
 
     .chart-panel-title {
         font-family: 'Outfit', sans-serif;
-        font-size: 1.25rem;
+        font-size: 1.08rem;
         font-weight: 700;
         color: var(--adm-text-main);
         letter-spacing: -0.01em;
         display: flex;
         align-items: center;
-        gap: 10px;
+        gap: 8px;
     }
     .chart-panel-title i {
         color: var(--adm-brand);
-        font-size: 1.1rem;
+        font-size: 1.05rem;
     }
 
     .chart-panel-desc {
-        font-size: 0.84rem;
+        font-size: 0.80rem;
         color: var(--adm-muted);
         margin-top: 2px;
     }
@@ -592,7 +566,7 @@ try {
     .chart-canvas-container {
         position: relative;
         width: 100%;
-        height: 280px;
+        height: 200px;
     }
 
     /* ── Live Attendance Activity Table ── */
@@ -814,116 +788,68 @@ try {
     
     <!-- 1. Total Workforce -->
     <div class="dash-card animate-up stagger-1" onclick="window.location.href='employee'" style="cursor: pointer;" title="View all employees">
-        <div>
-            <div class="dash-card-top">
-                <div class="dash-card-icon dash-card-icon--blue">
-                    <i class="fa-solid fa-users icon-anim-float"></i>
-                </div>
-                <span class="dash-card-chip">Registered</span>
+        <div class="dash-card-top">
+            <div class="dash-card-icon dash-card-icon--blue">
+                <i class="fa-solid fa-users"></i>
             </div>
             <p class="dash-card-title">Total Workforce</p>
-            <p class="dash-card-value"><?php echo number_format($totalEmployees); ?></p>
         </div>
-        <div class="dash-card-subtext">
-            <i class="fa-solid fa-building-user" style="color: var(--adm-brand);"></i>
-            <span>Active corporate team</span>
-        </div>
+        <p class="dash-card-value"><?php echo number_format($totalEmployees); ?></p>
     </div>
 
     <!-- 2. Present Today -->
     <div class="dash-card animate-up stagger-2" onclick="window.location.href='attendance'" style="cursor: pointer;" title="View present employees today">
-        <div>
-            <div class="dash-card-top">
-                <div class="dash-card-icon dash-card-icon--green">
-                    <i class="fa-solid fa-user-check icon-anim-bounce"></i>
-                </div>
-                <span class="dash-card-chip success">
-                    <?php echo $totalEmployees > 0 ? round(($presentToday / $totalEmployees) * 100) : 0; ?>% Ratio
-                </span>
+        <div class="dash-card-top">
+            <div class="dash-card-icon dash-card-icon--green">
+                <i class="fa-solid fa-user-check"></i>
             </div>
             <p class="dash-card-title">Present Today</p>
-            <p class="dash-card-value"><?php echo number_format($presentToday); ?></p>
         </div>
-        <div class="dash-card-subtext">
-            <i class="fa-solid fa-circle" style="font-size: 0.55rem; color: var(--adm-success);"></i>
-            <span>Checked in &bull; On duty</span>
-        </div>
+        <p class="dash-card-value"><?php echo number_format($presentToday); ?></p>
     </div>
 
     <!-- 3. Absent Today -->
     <div class="dash-card animate-up stagger-3" onclick="window.location.href='attendance'" style="cursor: pointer;" title="View absent employees">
-        <div>
-            <div class="dash-card-top">
-                <div class="dash-card-icon" style="background: var(--adm-danger-light); color: var(--adm-danger);">
-                    <i class="fa-solid fa-user-xmark icon-anim-pulse"></i>
-                </div>
-                <span class="dash-card-chip danger">Absent</span>
+        <div class="dash-card-top">
+            <div class="dash-card-icon" style="background: var(--adm-danger-light); color: var(--adm-danger);">
+                <i class="fa-solid fa-user-xmark"></i>
             </div>
             <p class="dash-card-title">Absent Today</p>
-            <p class="dash-card-value"><?php echo number_format($absentToday); ?></p>
         </div>
-        <div class="dash-card-subtext">
-            <i class="fa-solid fa-circle-exclamation" style="color: var(--adm-danger);"></i>
-            <span>Not logged in today</span>
-        </div>
+        <p class="dash-card-value"><?php echo number_format($absentToday); ?></p>
     </div>
 
     <!-- 4. Late Today -->
     <div class="dash-card animate-up stagger-4" onclick="window.location.href='attendance'" style="cursor: pointer;" title="View delayed arrivals">
-        <div>
-            <div class="dash-card-top">
-                <div class="dash-card-icon dash-card-icon--orange">
-                    <i class="fa-solid fa-clock icon-anim-spin"></i>
-                </div>
-                <span class="dash-card-chip" style="background: var(--adm-warning-light); color: var(--adm-warning);">Delayed</span>
+        <div class="dash-card-top">
+            <div class="dash-card-icon dash-card-icon--orange">
+                <i class="fa-solid fa-clock"></i>
             </div>
             <p class="dash-card-title">Late Today</p>
-            <p class="dash-card-value"><?php echo number_format($lateToday); ?></p>
         </div>
-        <div class="dash-card-subtext">
-            <i class="fa-solid fa-hourglass-end" style="color: var(--adm-warning);"></i>
-            <span>Grace period exceeded</span>
-        </div>
+        <p class="dash-card-value"><?php echo number_format($lateToday); ?></p>
     </div>
 
     <!-- 5. Early Leave Today -->
     <div class="dash-card animate-up stagger-5" onclick="window.location.href='attendance'" style="cursor: pointer;" title="View early departures">
-        <div>
-            <div class="dash-card-top">
-                <div class="dash-card-icon dash-card-icon--purple">
-                    <i class="fa-solid fa-person-walking-arrow-right icon-anim-bounce"></i>
-                </div>
-                <span class="dash-card-chip">Early Exit</span>
+        <div class="dash-card-top">
+            <div class="dash-card-icon dash-card-icon--purple">
+                <i class="fa-solid fa-person-walking-arrow-right"></i>
             </div>
             <p class="dash-card-title">Early Departures</p>
-            <p class="dash-card-value"><?php echo number_format($earlyLeaveToday); ?></p>
         </div>
-        <div class="dash-card-subtext">
-            <i class="fa-solid fa-right-from-bracket" style="color: #8b5cf6;"></i>
-            <span>Clocked out early</span>
-        </div>
+        <p class="dash-card-value"><?php echo number_format($earlyLeaveToday); ?></p>
     </div>
 
     <!-- 6. Monthly Attendance Efficiency -->
     <div class="dash-card animate-up stagger-6" onclick="window.location.href='reports'" style="cursor: pointer;" title="View monthly attendance rate">
-        <div>
-            <div class="dash-card-top">
-                <div class="dash-card-icon" style="background: var(--adm-success-light); color: var(--adm-success);">
-                    <i class="fa-solid fa-chart-line icon-anim-sparkle"></i>
-                </div>
-                <span class="dash-card-chip success"><?php echo date('M Y'); ?></span>
+        <div class="dash-card-top">
+            <div class="dash-card-icon" style="background: var(--adm-success-light); color: var(--adm-success);">
+                <i class="fa-solid fa-chart-line"></i>
             </div>
             <p class="dash-card-title">Monthly Efficiency</p>
-            <p class="dash-card-value"><?php echo $monthlyAttendanceRate; ?>%</p>
         </div>
-        <div>
-            <div class="dash-mini-progress">
-                <div class="dash-mini-progress-fill" style="width: <?php echo min(100, max(0, $monthlyAttendanceRate)); ?>%;"></div>
-            </div>
-            <div class="dash-card-subtext" style="margin-top: 6px;">
-                <span>Monthly completion metric</span>
-            </div>
-        </div>
+        <p class="dash-card-value"><?php echo $monthlyAttendanceRate; ?>%</p>
     </div>
 
 </div>
@@ -963,7 +889,7 @@ try {
             </div>
         </div>
 
-        <div class="chart-canvas-container" style="display: flex; align-items: center; justify-content: center;">
+        <div class="chart-canvas-container">
             <canvas id="todayChart"></canvas>
         </div>
     </div>
@@ -1179,30 +1105,34 @@ document.addEventListener('DOMContentLoaded', function() {
     const ctxToday = document.getElementById('todayChart')?.getContext('2d');
     let todayChart = null;
     if (ctxToday) {
+        const rawTodayData = [
+            <?php echo $presentToday; ?>, 
+            <?php echo $absentToday; ?>, 
+            <?php echo $lateToday; ?>, 
+            <?php echo $earlyLeaveToday; ?>
+        ];
+        const sumToday = rawTodayData.reduce((a, b) => a + b, 0);
+        const hasData = sumToday > 0;
+
         todayChart = new Chart(ctxToday, {
             type: 'doughnut',
             data: {
                 labels: ['Present', 'Absent', 'Late', 'Early Exit'],
                 datasets: [{
-                    data: [
-                        <?php echo $presentToday; ?>, 
-                        <?php echo $absentToday; ?>, 
-                        <?php echo $lateToday; ?>, 
-                        <?php echo $earlyLeaveToday; ?>
-                    ],
-                    backgroundColor: colors.donutColors,
+                    data: hasData ? rawTodayData : [1],
+                    backgroundColor: hasData ? colors.donutColors : [colors.gridColor || 'rgba(148, 163, 184, 0.25)'],
                     borderWidth: 0,
-                    hoverOffset: 6
+                    hoverOffset: hasData ? 5 : 0
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                cutout: '72%',
+                cutout: '68%',
                 animation: {
                     animateScale: true,
                     animateRotate: true,
-                    duration: 1200
+                    duration: 1000
                 },
                 plugins: {
                     legend: {
@@ -1212,11 +1142,13 @@ document.addEventListener('DOMContentLoaded', function() {
                             font: { family: "'Plus Jakarta Sans', sans-serif", weight: '600', size: 11 },
                             usePointStyle: true,
                             pointStyle: 'circle',
-                            padding: 14
+                            padding: 10,
+                            boxWidth: 8
                         }
                     },
                     tooltip: {
-                        padding: 12,
+                        enabled: hasData,
+                        padding: 10,
                         cornerRadius: 8,
                         titleFont: { family: "'Plus Jakarta Sans', sans-serif", weight: '700' }
                     }
@@ -1239,6 +1171,17 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             if (todayChart) {
                 todayChart.options.plugins.legend.labels.color = newColors.textColor;
+                const curSum = [
+                    <?php echo $presentToday; ?>, 
+                    <?php echo $absentToday; ?>, 
+                    <?php echo $lateToday; ?>, 
+                    <?php echo $earlyLeaveToday; ?>
+                ].reduce((a, b) => a + b, 0);
+                if (curSum > 0) {
+                    todayChart.data.datasets[0].backgroundColor = newColors.donutColors;
+                } else {
+                    todayChart.data.datasets[0].backgroundColor = [newColors.gridColor || 'rgba(148, 163, 184, 0.25)'];
+                }
                 todayChart.update();
             }
         }, 50);

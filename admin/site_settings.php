@@ -1040,6 +1040,21 @@ include 'header.php';
         </div>
 
         <div class="settings-actions-group">
+            <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <a href="settings" class="btn-saas btn-saas-secondary" title="Navigate to Account and Security Settings">
+                    <i class="fa-solid fa-user-gear"></i>
+                    <span>Account</span>
+                </a>
+                <a href="site_settings" class="btn-saas btn-saas-primary" title="Current: White-Label Platform Branding &amp; SMTP Infrastructure">
+                    <i class="fa-solid fa-sliders"></i>
+                    <span>Branding &amp; SMTP</span>
+                </a>
+                <a href="office_location" class="btn-saas btn-saas-secondary" title="Navigate to Office GPS Location &amp; Attendance Geofencing">
+                    <i class="fa-solid fa-location-dot"></i>
+                    <span>Office GPS</span>
+                </a>
+            </div>
+
             <!-- Test SMTP Connection Button -->
             <button type="button" class="btn-saas btn-saas-test" onclick="openSmtpDiagModal()" title="Verify outgoing SMTP delivery and test handshake">
                 <i class="fa-solid fa-paper-plane"></i>

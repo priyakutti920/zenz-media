@@ -8,6 +8,7 @@
 require_once 'app/db.php';
 require_once 'app/security.php';
 require_once 'app/Mailer.php';
+require_once 'app/LeaveHelper.php';
 
 if (isset($pdo) && $pdo instanceof PDO) {
     Security::init($pdo);
@@ -118,24 +119,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $messageType = 'error';
                 } else {
                     $days = (int)$end->diff($start)->days + 1;
-                    $departureVal = ($leaveType === 'early_departure' && !empty($depTime)) ? $depTime : null;
 
-                    $stmt = $pdo->prepare("INSERT INTO leave_requests 
-                        (employee_id, leave_type, start_date, end_date, days, reason, early_departure_time, status) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')");
-                    $stmt->execute([$employee_id, $leaveType, $startDate, $endDate, $days, $reason, $departureVal]);
+                    // 1. Check for overlapping requests
+                    $overlap = LeaveHelper::checkOverlap($pdo, $employee_id, $startDate, $endDate);
+                    if ($overlap) {
+                        $message     = "Date Conflict: You already have a " . ucfirst($overlap['status']) . " leave from {$overlap['start_date']} to {$overlap['end_date']}.";
+                        $messageType = 'error';
+                    } else {
+                        // 2. Check balance entitlement
+                        $leaveYear = (int)date('Y', strtotime($startDate));
+                        $balances = LeaveHelper::getEmployeeBalances($pdo, $employee_id, $leaveYear);
+                        $hasBalance = true;
 
-                    // Safe Email Alert (Non-blocking)
-                    try {
-                        $mailer = new Mailer($pdo);
-                        $typeLabel = $leaveTypes[$leaveType]['label'] ?? $leaveType;
-                        $mailer->sendLeaveRequestAlert($employee_name, $typeLabel, $startDate, $endDate, $reason);
-                    } catch (Throwable $mailEx) {
-                        error_log("Leave request mailer error: " . $mailEx->getMessage());
+                        if (isset($balances[$leaveType]) && $balances[$leaveType]['remaining_days'] < $days) {
+                            $hasBalance = false;
+                            $rem = $balances[$leaveType]['remaining_days'];
+                            $message = "Insufficient leave balance for {$leaveTypes[$leaveType]['label']}. You have {$rem} day(s) remaining, but requested {$days} day(s).";
+                            $messageType = 'error';
+                        }
+
+                        if ($hasBalance) {
+                            $departureVal = ($leaveType === 'early_departure' && !empty($depTime)) ? $depTime : null;
+
+                            $stmt = $pdo->prepare("INSERT INTO leave_requests 
+                                (employee_id, leave_type, start_date, end_date, days, reason, early_departure_time, status) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')");
+                            $stmt->execute([$employee_id, $leaveType, $startDate, $endDate, $days, $reason, $departureVal]);
+
+                            // Safe Email Alert (Non-blocking)
+                            try {
+                                $mailer = new Mailer($pdo);
+                                $typeLabel = $leaveTypes[$leaveType]['label'] ?? $leaveType;
+                                $mailer->sendLeaveRequestAlert($employee_name, $typeLabel, $startDate, $endDate, $reason);
+                            } catch (Throwable $mailEx) {
+                                error_log("Leave request mailer error: " . $mailEx->getMessage());
+                            }
+
+                            $message     = 'Leave request for ' . $days . ' day' . ($days > 1 ? 's' : '') . ' submitted successfully. You will receive an approved LV Code upon review.';
+                            $messageType = 'success';
+                        }
                     }
-
-                    $message     = 'Leave request for ' . $days . ' day' . ($days > 1 ? 's' : '') . ' submitted successfully. You will receive an approved LV Code upon review.';
-                    $messageType = 'success';
                 }
             } catch (Exception $e) {
                 error_log("Leave submission error: " . $e->getMessage());
